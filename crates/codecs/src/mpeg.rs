@@ -798,8 +798,8 @@ impl MediaSource for MpegSource {
         }
         let rate = self.info.frame_rate();
         let f = rate.frame_at(req.time.max(Tick::ZERO)).clamp(0, v.order.len() as i64 - 1);
-        let late = filmcraft_media::cancel::catch_up().map(|m| rate.frame_at(req.time - m));
-        Ok(self.gop.frame_late(&MpegVideo { src: self, v }, f, late)?)
+        let late = || filmcraft_media::cancel::catch_up().map(|m| rate.frame_at(req.time - m));
+        Ok(self.gop.frame_late(&MpegVideo { src: self, v }, f, &late)?)
     }
 
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer, MediaError> {

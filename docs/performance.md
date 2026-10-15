@@ -80,6 +80,55 @@ What remains per live decoder is unchanged: the H.264 decoder publishes each mac
 picture as its own allocations (`Frame::make_row`, five per row), which is where the 290 MB per
 decoder comes from.
 
+## 4K 10-bit 4:2:2 LongGOP playback when decoding is just under real time (PERF6)
+
+Same machine and clip as MEM5 below: Ryzen 7 7730U (8 cores / 16 threads, 15 W, Radeon Vega 7
+iGPU), Fujifilm X-S20 HEVC Main 4:2:2 10 at 3840x2160, 23.976 fps, 87 Mbit/s, LongGOP (a
+sync sample every 24 frames, P pictures only). No GPU in this class decodes HEVC 4:2:2 (AMD
+none, NVIDIA from Blackwell, Intel from 11th gen): it is software or nothing, and the software
+decoder runs at about real time here.
+
+### Playback (`bench_playback --scenario files-seq --media clip.mov`, 12 s clip, 10 s plays)
+
+When decoding fell even a few per cent short of real time inside the app (it shares the CPU and
+the 15 W with the GPU compositor), the monitor showed almost nothing. Frames shown on time (of
+~240), monitor drawn at 1/2 (a laptop screen), before / after this change alternating, three
+rounds, load average under 2 at the start:
+
+| round | before | after |
+|---|---|---|
+| 1 | 11 (4 %) | 183 (77 %) |
+| 2 | 9 (3 %) | 19 (6 %) |
+| 3 | 10 (4 %) | 159 (67 %) |
+
+The after column varies with how far behind the decoder is when a GOP starts (round 2 never
+got ahead); faster decoding makes it steadier. A monitor at 1:1 (4K drawn in full) stays
+GPU-bound on this iGPU: ~55 ms to upload and draw a 4K frame.
+
+What changed:
+
+- **Playback plans at the size drawn.** Reduced-resolution playback box-filtered planes to twice
+  the size drawn, so 4K in a monitor drawn at 1/2 still uploaded and drew every sample:
+  ~50 ms a frame on the iGPU. It now prepares, uploads and draws the drawn size (a quarter of
+  the samples at 1/2): 14 ms. A paused frame is rendered in full as before.
+- **Late frames are still shown.** Jobs for frames the playhead passed were cancelled at once,
+  though the monitor shows a frame up to `LATE_HOLD_FRAMES` (6) behind: with decoding just
+  under real time every job was cancelled and the monitor showed a handful of distinct frames
+  per second.
+- **A live catch-up deadline.** `filmcraft_media::cancel::catch_up` is measured at an instant
+  and shrinks as playback moves on; the frame cache reads it once it has the decoder, so a
+  request that waited in the queue or behind another decode sees the playhead now.
+- **Catch-up jumps** (`GopCache::catch_up`): when the decoder's newest frame is more than 6
+  frames behind the playhead, it restarts at the first sync sample at least 12 frames ahead
+  (at most 2 s), and requests for the frames between are given up (not cached as results).
+  A second or so is dropped at a GOP boundary instead of every following frame arriving late.
+- **Decoded frames without waiting for the decoder.** A request whose frame another request
+  has already decoded is answered from the cache while that request still holds the decoder.
+- **Memory budget moved to the decoder.** The decoder's share went from 4 % (640 MB max) to 7 %
+  (1 GiB max), about ten 4K pictures in flight instead of six (frame threading decodes ~7 %
+  faster with them on this clip); the decoded-frame cache went from 12 % to 8 % (2 GiB max).
+  Resident memory while playing is unchanged (~2.8–3.0 GB).
+
 ## Memory governor: two 4K 10-bit 4:2:2 clips on a 16 GB laptop (MEM5)
 
 Two Fujifilm X-S20 clips (HEVC Main 4:2:2 10, 3840x2160, decoded in software: VA-API declines

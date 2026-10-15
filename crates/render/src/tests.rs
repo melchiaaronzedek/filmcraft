@@ -401,10 +401,14 @@ fn draft_reduced_resolution_plans_carry_decimated_yuv() {
     map.0.insert(red, Arc::new(YuvSource(matte)) as SharedSource);
     place(&mut p, seq, 0, red, 0, 48);
     let t = FrameRate::FPS_24.tick_of(3);
-    for draft in [false, true] {
+    // exact, draft and reduced-resolution playback (which plans at the drawn size as draft does)
+    for (draft, reduced) in [(false, false), (true, false), (false, true)] {
         for (scale, small_w) in [(1.0f32, 320u32), (0.5, 160), (0.25, 80)] {
             let opts = RenderOptions { scale, ..Default::default() };
-            let plan = filmcraft_media::cancel::with_draft(draft, || plan::plan_frame(&p, seq, t, opts, &map));
+            let plan = filmcraft_media::cancel::with_reduced_resolution(reduced, || {
+                filmcraft_media::cancel::with_draft(draft, || plan::plan_frame(&p, seq, t, opts, &map))
+            });
+            let draft = draft || reduced;
             let plan::FramePlan::Layers { layers, .. } = &plan else { panic!("GPU-drawable") };
             // exact playback hands over the decoded picture; draft playback planes at the drawn size
             assert_eq!(layers[0].frame.width, if draft { small_w } else { 320 }, "scale {scale}, draft {draft}");

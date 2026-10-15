@@ -130,10 +130,11 @@ pub struct Budget {
 }
 
 impl Budget {
-    /// Decoded frames held by all the clips' frame caches together.
-    pub const DECODED_FRAMES: Budget = Budget { percent: 12, min: 384 * MIB, max: 3 * GIB };
+    /// Decoded frames held by all the clips' frame caches together (playback consumes them as
+    /// they come: the share went to [`Budget::DECODER`], which decides whether 4K plays at all).
+    pub const DECODED_FRAMES: Budget = Budget { percent: 8, min: 384 * MIB, max: 2 * GIB };
     /// The pictures one decoder works on in parallel (frame threading).
-    pub const DECODER: Budget = Budget { percent: 4, min: 192 * MIB, max: 640 * MIB };
+    pub const DECODER: Budget = Budget { percent: 7, min: 192 * MIB, max: 1024 * MIB };
     /// Prepared compositing plans of the monitors (GPU path).
     pub const PLANS: Budget = Budget { percent: 6, min: 128 * MIB, max: GIB };
     /// Finished RGBA frames of the monitors, thumbnails and scopes (CPU path).
@@ -215,10 +216,10 @@ mod tests {
     #[test]
     fn budgets_scale_clamp_and_halve_under_pressure() {
         let b = Budget::DECODER;
-        // a 16 GB machine with 4 GB reserved: 4 % of 12 GB
+        // a 16 GB machine with 4 GB reserved: its percentage of 12 GB
         let app = 12 * GIB;
-        assert_eq!(b.bytes_for(app, false) as u64, app / 100 * 4);
-        assert_eq!(b.bytes_for(app, true) as u64, (app / 100 * 4) / 2);
+        assert_eq!(b.bytes_for(app, false) as u64, app / 100 * b.percent);
+        assert_eq!(b.bytes_for(app, true) as u64, (app / 100 * b.percent) / 2);
         // never below the minimum, never above the maximum
         assert_eq!(b.bytes_for(GIB, false) as u64, b.min);
         assert_eq!(b.bytes_for(GIB, true) as u64, b.min);

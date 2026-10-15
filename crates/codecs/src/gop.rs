@@ -34,6 +34,10 @@ pub struct GopStats {
     pub decode_ns: u64,
     /// Non-reference samples left out while catching up (frames already late).
     pub skipped: u64,
+    /// Restarts at a later sync sample by playback that fell behind, and the requests for
+    /// frames jumped over that were given up ([`GopCache::frame_late`]).
+    pub catch_up_jumps: u64,
+    pub catch_up_dropped: u64,
     /// Frames decoded in draft mode (reduced-resolution playback, [`VideoDecoder::set_draft`]).
     pub draft: u64,
     /// Pictures decoders output (hardware and software; [`crate::hw::hw_stats`] counts the
@@ -61,6 +65,8 @@ static DECODED: AtomicU64 = AtomicU64::new(0);
 static EVICTED: AtomicU64 = AtomicU64::new(0);
 static DECODE_NS: AtomicU64 = AtomicU64::new(0);
 static SKIPPED: AtomicU64 = AtomicU64::new(0);
+static CATCH_UP_JUMPS: AtomicU64 = AtomicU64::new(0);
+static CATCH_UP_DROPPED: AtomicU64 = AtomicU64::new(0);
 static DRAFT: AtomicU64 = AtomicU64::new(0);
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -87,6 +93,8 @@ pub fn gop_stats() -> GopStats {
         evicted: EVICTED.load(Ordering::Relaxed),
         decode_ns: DECODE_NS.load(Ordering::Relaxed),
         skipped: SKIPPED.load(Ordering::Relaxed),
+        catch_up_jumps: CATCH_UP_JUMPS.load(Ordering::Relaxed),
+        catch_up_dropped: CATCH_UP_DROPPED.load(Ordering::Relaxed),
         draft: DRAFT.load(Ordering::Relaxed),
         frames: FRAMES.load(Ordering::Relaxed),
     }
@@ -103,6 +111,8 @@ impl std::ops::Sub for GopStats {
             evicted: self.evicted - o.evicted,
             decode_ns: self.decode_ns - o.decode_ns,
             skipped: self.skipped - o.skipped,
+            catch_up_jumps: self.catch_up_jumps.saturating_sub(o.catch_up_jumps),
+            catch_up_dropped: self.catch_up_dropped.saturating_sub(o.catch_up_dropped),
             draft: self.draft - o.draft,
             frames: self.frames - o.frames,
         }
@@ -135,6 +145,23 @@ fn decode_start(s: &dyn VideoSamples, i: usize) -> usize {
     key
 }
 
+/// The decoded frames of a cache, readable while a request holds the cache's lock to decode
+/// (seconds at times, a whole GOP of 4K): playback's requests for frames that request has
+/// already decoded are served at once instead of queueing behind it. Kept in step with
+/// `State::frames` by every change of it (the state's lock held, then this one, briefly).
+#[derive(Default)]
+struct Ready(Mutex<BTreeMap<i64, (Arc<VideoFrame>, bool)>>);
+
+impl Ready {
+    fn map(&self) -> MutexGuard<'_, BTreeMap<i64, (Arc<VideoFrame>, bool)>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// The frame at `pts`, unless it is a draft and the request wants the exact one.
+    fn get(&self, pts: i64, draft_ok: bool) -> Option<Arc<VideoFrame>> {
+        self.map().get(&pts).filter(|(_, draft)| draft_ok || !draft).map(|(f, _)| f.clone())
+    }
+}
+
 struct State {
     decoder: Option<Box<dyn VideoDecoder>>,
     /// The decoder only produces intra pictures: frames decode independently and in parallel.
@@ -146,6 +173,14 @@ struct State {
     start: usize,
     /// Highest pts the running decoder has output since it started (pictures leave in pts order).
     out_max: i64,
+    /// Presentation pts `[from, to)` playback that fell behind jumped over (see
+    /// [`GopCache::catch_up`]): while playing, those frames are given up rather than decoded by
+    /// going back for them.
+    skipped: Option<(i64, i64)>,
+    /// The sync sample such a jump restarts the decoder at (on the next decode).
+    jump_to: Option<usize>,
+    /// `frames` (and whether each is a draft) behind a lock of its own: see [`Ready`].
+    ready: Arc<Ready>,
     /// Decoded frames by presentation pts (bounded).
     frames: BTreeMap<i64, Arc<VideoFrame>>,
     /// The cached frames that were decoded in draft mode: served to draft requests only.
@@ -185,6 +220,7 @@ impl State {
         while more() {
             let Some((pts, f)) = self.frames.pop_first() else { break };
             self.drafts.remove(&pts);
+            self.ready.map().remove(&pts);
             self.bytes = self.bytes.saturating_sub(f.byte_size());
             pool.bytes.fetch_sub(f.byte_size(), Ordering::Relaxed);
             EVICTED.fetch_add(1, Ordering::Relaxed);
@@ -289,6 +325,8 @@ const IN_USE_REFRESH: Duration = Duration::from_millis(200);
 /// The part of a [`GopCache`] its pool reaches.
 struct Shared {
     state: Mutex<State>,
+    /// The same as `state.ready`, reachable without the state's lock.
+    ready: Arc<Ready>,
     pool: Arc<Pool>,
 }
 
@@ -501,6 +539,22 @@ const FLOOR_FRAMES: usize = 16;
 /// rather than restarting at the sync sample.
 const CONTINUE_THROUGH: usize = 48;
 
+/// Playback whose decoder's newest frame is more than this many frames behind the playhead jumps
+/// to the next sync sample ([`GopCache::catch_up`]). Up to here a monitor still shows the late
+/// frames as they come (moving, a little behind); beyond, it would hold one picture.
+const CATCH_UP_LAG_FRAMES: i64 = 6;
+
+/// A catch-up jump goes to a sync sample at least this many frames past the playhead: a
+/// restarted frame-threaded 4K decoder takes about a third of a second to output its first frame.
+const CATCH_UP_LEAD_FRAMES: i64 = 12;
+
+/// A catch-up jump drops at most this many frames past the playhead (2 s at 24p): further sync
+/// samples (long GOPs) are not jumped to.
+const CATCH_UP_MAX_FRAMES: i64 = 48;
+
+/// How far past the playhead (samples) a catch-up jump looks for a sync sample.
+const CATCH_UP_SEARCH: usize = 96;
+
 /// Threads that run the caches' decoding (see [`isolated`]); `None` where none can be made.
 #[cfg(not(target_arch = "wasm32"))]
 fn decode_pool() -> Option<&'static rayon::ThreadPool> {
@@ -560,7 +614,9 @@ impl GopCache {
     }
 
     fn in_pool(explicit_color: Option<ColorInfo>, pool: Arc<Pool>) -> Self {
+        let ready = Arc::new(Ready::default());
         let shared = Arc::new(Shared {
+            ready: ready.clone(),
             state: Mutex::new(State {
                 decoder: None,
                 intra: false,
@@ -575,6 +631,9 @@ impl GopCache {
                 pin: i64::MIN,
                 background: false,
                 foreground_used: None,
+                skipped: None,
+                jump_to: None,
+                ready,
             }),
             pool: pool.clone(),
         });
@@ -632,7 +691,9 @@ impl GopCache {
         let budget = (pool.budget() / pool.in_use()).clamp(floor, cap);
         let before = st.bytes;
         st.bytes += f.byte_size();
-        if let Some(old) = st.frames.insert(pts, Arc::new(f)) {
+        let f = Arc::new(f);
+        st.ready.map().insert(pts, (f.clone(), draft));
+        if let Some(old) = st.frames.insert(pts, f) {
             st.bytes -= old.byte_size();
             filmcraft_frame::pool::recycle(old);
         }
@@ -651,6 +712,7 @@ impl GopCache {
             }
             if let Some(v) = st.frames.remove(&victim) {
                 st.drafts.remove(&victim);
+                st.ready.map().remove(&victim);
                 st.bytes -= v.byte_size();
                 EVICTED.fetch_add(1, Ordering::Relaxed);
                 // its planes serve the next decoded pictures instead of going back to the allocator
@@ -681,7 +743,7 @@ impl GopCache {
     /// cache's lock. Such a nested request must not lock again (deadlock): it decodes the frame
     /// with a private decoder instead ([`Self::private_frame`]).
     pub fn frame(&self, s: &dyn VideoSamples, target: i64) -> crate::Result<Arc<VideoFrame>> {
-        self.frame_late(s, target, None)
+        self.frame_late(s, target, &|| None)
     }
 
     /// [`Self::frame`] while catching up: frames shown before `late_before` (track units) are
@@ -692,7 +754,10 @@ impl GopCache {
     /// Inside [`filmcraft_media::cancel::with_draft`]`(true, …)` the decoder runs in draft mode
     /// ([`VideoDecoder::set_draft`]); its draft frames are cached for draft requests only, and an
     /// exact request for one re-decodes it.
-    pub fn frame_late(&self, s: &dyn VideoSamples, target: i64, late_before: Option<i64>) -> crate::Result<Arc<VideoFrame>> {
+    ///
+    /// `late_before` is asked once the cache is free to decode (another request may have used it
+    /// a while): the playhead then, not when the request was made.
+    pub fn frame_late(&self, s: &dyn VideoSamples, target: i64, late_before: &dyn Fn() -> Option<i64>) -> crate::Result<Arc<VideoFrame>> {
         let r = self.frame_late_locked(s, target, late_before);
         if filmcraft_media::cancel::background() {
             // Outside the cache's lock (see `release_background`). A thumbnail leaves the decoders
@@ -702,7 +767,7 @@ impl GopCache {
         r
     }
 
-    fn frame_late_locked(&self, s: &dyn VideoSamples, target: i64, late_before: Option<i64>) -> crate::Result<Arc<VideoFrame>> {
+    fn frame_late_locked(&self, s: &dyn VideoSamples, target: i64, late_before: &dyn Fn() -> Option<i64>) -> crate::Result<Arc<VideoFrame>> {
         let n = s.count();
         let i = s.sample_at(target.max(0)).or_else(|| (n > 0).then(|| n - 1)).ok_or_else(|| CodecError::Decode("empty track".into()))?;
         let want_pts = s.pts(i);
@@ -715,7 +780,19 @@ impl GopCache {
         // after the guard on every return path: dropping a decoder can block (a hardware session
         // waits for its frames in flight) and must not hold this cache's lock.
         let mut released: Vec<Box<dyn VideoDecoder>> = Vec::new();
-        let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = match self.shared.state.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                // Another request is decoding (it holds the lock until its frame is out): a frame
+                // it has decoded already needs no waiting for that.
+                if let Some(f) = self.shared.ready.get(want_pts, draft) {
+                    HITS.fetch_add(1, Ordering::Relaxed);
+                    return Ok(f);
+                }
+                self.shared.state.lock().unwrap_or_else(|e| e.into_inner())
+            }
+        };
         let _decoding = DecodingGuard::enter(me);
         st.last_used = Instant::now();
         let background = filmcraft_media::cancel::background();
@@ -769,9 +846,61 @@ impl GopCache {
         if st.intra {
             return self.intra_frame(st, s, i, want_pts);
         }
+        // The playhead now (a request may have waited for the lock as long as another took to
+        // decode): frames shown before it are late.
+        let late_before = late_before();
+        match late_before {
+            Some(late) => {
+                Self::catch_up(&mut st, s, late, n);
+                if st.skipped.is_some_and(|(from, to)| from <= want_pts && want_pts < to) {
+                    // jumped over (now or before): going back for it would put the decoder
+                    // behind the playhead again. Not cached as a result (see `pending`): asked
+                    // for while paused, it is decoded.
+                    CATCH_UP_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    filmcraft_media::pending::mark();
+                    return Err(CodecError::Cancelled);
+                }
+            }
+            None => {
+                // not playing: every frame is wanted again
+                st.skipped = None;
+                st.jump_to = None;
+            }
+        }
         // with the lock held: see `isolated`
         let st = &mut *st;
         isolated(|| self.decode_until(st, s, i, want_pts, late_before, draft))
+    }
+
+    /// Playback far behind: the newest frame the decoder has output is more than
+    /// [`CATCH_UP_LAG_FRAMES`] before the playhead `late` (frames leave the decoder in
+    /// presentation order, so all those still to come are later). Every frame it has yet to make
+    /// up to there would be late, and the P pictures of a LongGOP cannot be left out one by one:
+    /// jump to the first sync sample well ahead of the playhead instead (on the next decode), giving
+    /// up the frames in between. A second or so of 4K 4:2:2 is dropped at once, and the decoder
+    /// is ahead of the playhead again, instead of every frame from then on arriving late (the
+    /// lag growing for good when decoding is a little slower than real time).
+    fn catch_up(st: &mut State, s: &dyn VideoSamples, late: i64, n: usize) {
+        if st.decoder.is_none() || st.next == usize::MAX || st.out_max == i64::MIN || st.jump_to.is_some() || n < 2 {
+            return;
+        }
+        let frame = (s.pts(n - 1) - s.pts(0)) / (n as i64 - 1);
+        if frame <= 0 || late.saturating_sub(st.out_max) <= CATCH_UP_LAG_FRAMES.saturating_mul(frame) {
+            return;
+        }
+        let from = s.sample_at(late).unwrap_or(st.next).max(st.next);
+        // far enough ahead that a restarted decoder has its first frame out before it is due
+        let ahead = late.saturating_add(CATCH_UP_LEAD_FRAMES.saturating_mul(frame));
+        let Some(k) = (from..n.min(from.saturating_add(CATCH_UP_SEARCH))).find(|&k| s.sync_before(k) == k && s.pts(k) >= ahead) else {
+            return;
+        };
+        if s.pts(k).saturating_sub(late) > CATCH_UP_MAX_FRAMES.saturating_mul(frame) {
+            // long GOPs: dropping that much is worse than showing frames late
+            return;
+        }
+        st.skipped = Some((st.out_max.saturating_add(1), s.pts(k)));
+        st.jump_to = Some(k);
+        CATCH_UP_JUMPS.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Decode (the lock held) until the frame with `want_pts` (sample `i`) is cached; return it.
@@ -785,6 +914,16 @@ impl GopCache {
         draft: bool,
     ) -> crate::Result<Arc<VideoFrame>> {
         let n = s.count();
+        if let Some(k) = st.jump_to.take() {
+            // a catch-up jump (`catch_up`): restart at that sync sample
+            SEEKS.fetch_add(1, Ordering::Relaxed);
+            if let Some(d) = st.decoder.as_mut() {
+                d.reset();
+            }
+            st.next = k;
+            st.start = k;
+            st.out_max = i64::MIN;
+        }
         let mut key = decode_start(s, i);
         // Continue the running decoder when it has passed the wanted sample's sync sample and
         // either has not reached the sample yet or has been fed it without outputting it yet
@@ -810,6 +949,7 @@ impl GopCache {
             if let Some(d) = st.decoder.as_mut() {
                 d.reset();
             }
+            st.skipped = None;
             st.next = key;
             st.start = key;
             st.out_max = i64::MIN;
@@ -1187,13 +1327,52 @@ mod tests {
     }
 
     #[test]
+    fn playback_far_behind_jumps_to_a_sync_sample_ahead_and_gives_up_the_frames_between() {
+        // a LongGOP: a sync sample every 24, P pictures only (nothing can be left out)
+        let s = samples(240, 24, 4, false);
+        let c = GopCache::new(None);
+        for i in 0..=10usize {
+            assert_eq!(index_of(&c.frame(&s, i as i64 * 1000).expect("frame")), i);
+        }
+        let resets = s.resets.load(Ordering::Relaxed);
+        // frame 11 is wanted while the playhead is at 40: the decoder is far behind. It jumps
+        // to the first sync sample at least 12 frames past the playhead (72), and frames up to
+        // there are given up (not cached as results: `pending`).
+        let _ = filmcraft_media::pending::take();
+        assert!(matches!(c.frame_late(&s, 11_000, &|| Some(40_000)), Err(CodecError::Cancelled)));
+        assert!(filmcraft_media::pending::take());
+        assert!(matches!(c.frame_late(&s, 50_000, &|| Some(41_000)), Err(CodecError::Cancelled)));
+        let decodes = s.decodes.load(Ordering::Relaxed);
+        assert_eq!(index_of(&c.frame_late(&s, 72_000, &|| Some(45_000)).expect("frame")), 72);
+        assert_eq!(s.resets.load(Ordering::Relaxed), resets + 1, "one restart, at the sync sample");
+        assert!(s.decodes.load(Ordering::Relaxed) - decodes <= 1 + 4, "decoded from 72 on, not 11..72");
+        // the next frames follow from there
+        for i in 73..80usize {
+            assert_eq!(index_of(&c.frame_late(&s, i as i64 * 1000, &|| Some(60_000)).expect("frame")), i);
+        }
+        // paused, a skipped frame is decoded again
+        assert_eq!(index_of(&c.frame(&s, 50_000).expect("frame")), 50);
+        // a little behind (within the frames a monitor still shows late) never jumps
+        let s2 = samples(240, 24, 4, false);
+        let c2 = GopCache::new(None);
+        assert_eq!(index_of(&c2.frame(&s2, 10_000).expect("frame")), 10);
+        assert_eq!(index_of(&c2.frame_late(&s2, 11_000, &|| Some(14_000)).expect("frame")), 11);
+        assert_eq!(s2.resets.load(Ordering::Relaxed), 1);
+        // a far sync sample (long GOP) is not jumped to: the frames come, late
+        let s3 = samples(400, 250, 4, false);
+        let c3 = GopCache::new(None);
+        assert_eq!(index_of(&c3.frame(&s3, 10_000).expect("frame")), 10);
+        assert_eq!(index_of(&c3.frame_late(&s3, 11_000, &|| Some(100_000)).expect("frame")), 11);
+    }
+
+    #[test]
     fn catching_up_skips_late_non_reference_samples_only() {
         let s = samples(300, 250, 4, false);
         let c = GopCache::new(None);
         assert_eq!(index_of(&c.frame(&s, 2_000).expect("frame")), 2);
         let before = s.decodes.load(Ordering::Relaxed);
         // playback is behind: frame 41 is due, 7..=40 are late
-        let f = c.frame_late(&s, 41_000, Some(41_000)).expect("frame");
+        let f = c.frame_late(&s, 41_000, &|| Some(41_000)).expect("frame");
         assert_eq!(index_of(&f), 41, "the wanted (odd, disposable) frame itself is decoded");
         let fed = s.decodes.load(Ordering::Relaxed) - before;
         // samples 7..41 minus the odd ones before 41, plus the decoder's output delay
@@ -1211,7 +1390,7 @@ mod tests {
         // a prefetch job for frame 41 while frame 30 is due: only frames before 30 are late
         let s3 = samples(300, 250, 0, false);
         let c3 = GopCache::new(None);
-        assert_eq!(index_of(&c3.frame_late(&s3, 41_000, Some(30_000)).expect("frame")), 41);
+        assert_eq!(index_of(&c3.frame_late(&s3, 41_000, &|| Some(30_000)).expect("frame")), 41);
         assert_eq!(s3.decodes.load(Ordering::Relaxed), 42 - 15, "odd samples 1..=29 skipped");
         for i in 30..41usize {
             assert_eq!(index_of(&c3.frame(&s3, i as i64 * 1000).expect("cached")), i);

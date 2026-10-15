@@ -456,18 +456,14 @@ fn push_item(
             // upload and sampling). The mean is taken over Y'CbCr codes, not linear light as
             // the shader's supersampling does, so this stays limited to the opt-in draft mode.
             //
-            // Playback (`with_reduced_resolution`) goes half way: planes box-filtered to twice the
-            // size drawn, which the shader then supersamples 2x2 in linear light. A 4K clip in a
-            // laptop-sized monitor (drawn at 1/4) is prepared, cached and uploaded at 1/4 of the
-            // samples instead of all of them; a paused frame is rendered again in full.
+            // Playback (`with_reduced_resolution`) does the same: a 4K clip in a monitor drawn at
+            // 1/2 is prepared, cached, uploaded and drawn at a quarter of the samples (at 1/4, a
+            // sixteenth). Keeping twice the size drawn for the shader's linear-light supersampling
+            // left 4K at 1/2 uploading and drawing every sample: on an integrated GPU sharing a
+            // laptop's power with a CPU decoding 4K, ~50 ms a frame, under 24 fps. A paused frame
+            // is rendered again in full.
             let n = crate::decimation(frame.width as f32, size.0 as f32 * want);
-            let n = if filmcraft_media::cancel::draft() {
-                n
-            } else if filmcraft_media::cancel::reduced_resolution() {
-                (n / 2).max(1)
-            } else {
-                1
-            };
+            let n = if filmcraft_media::cancel::draft() || filmcraft_media::cancel::reduced_resolution() { n } else { 1 };
             let frame = match frame.box_decimated(n) {
                 Some(small) => Arc::new(small),
                 None => frame,
