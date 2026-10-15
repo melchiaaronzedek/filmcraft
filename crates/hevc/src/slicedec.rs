@@ -12,7 +12,7 @@ use crate::params::{Layout, Pps, Sps};
 use crate::picture::{FrameRef, RefPic, Sample};
 use crate::slice::{SliceHeader, SliceType};
 use crate::spec_tables::*;
-use crate::tables::{CTX_IDX_MAP, INTRA_CHROMA_MODE_422, LEVEL_SCALE, SCAN_4, qpc, scan_order};
+use crate::tables::{INTRA_CHROMA_MODE_422, LEVEL_SCALE, SCAN_4, SIG_CTX_4X4, SIG_CTX_PATTERN, qpc, scan_order};
 use crate::transform;
 use std::sync::Arc;
 
@@ -1203,6 +1203,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         let log2sb = log2 - 2;
         let sb_scan = scan_order(log2sb, scan_idx);
         let pos_scan = &SCAN_4[scan_idx];
+        let sig_4x4 = &SIG_CTX_4X4[scan_idx];
         let sb_w = 1usize << log2sb;
         let last_sb = sb_scan.iter().position(|&(x, y)| x as u32 == lx >> 2 && y as u32 == ly >> 2).unwrap_or(0);
         let last_pos = pos_scan.iter().position(|&(x, y)| x as u32 == lx & 3 && y as u32 == ly & 3).unwrap_or(0);
@@ -1236,55 +1237,26 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             };
             if csbf[ys * 8 + xs] != 0 {
                 let prev_csbf = right + (below << 1);
+                let pattern = &SIG_CTX_PATTERN[scan_idx][(prev_csbf & 3) as usize];
+                // the luma / chroma, sub-block and block-size offsets of 9.3.4.2.5
+                let sig_base = if c == 0 {
+                    (if xs + ys > 0 { 3 } else { 0 }) + if log2 == 3 { if scan_idx == 0 { 9 } else { 15 } } else { 21 }
+                } else if log2 == 3 {
+                    9
+                } else {
+                    12
+                };
                 let mut np = start;
                 while np >= 0 {
                     let (xp, yp) = (pos_scan[np as usize].0 as usize, pos_scan[np as usize].1 as usize);
                     let (xc, yc) = (xs * 4 + xp, ys * 4 + yp);
                     if np > 0 || !infer_dc {
                         let sig_ctx = if log2 == 2 {
-                            CTX_IDX_MAP[(yc << 2) + xc] as usize
+                            sig_4x4[np as usize] as usize
                         } else if xc + yc == 0 {
                             0
                         } else {
-                            let mut s = match prev_csbf {
-                                0 => {
-                                    if xp + yp == 0 {
-                                        2
-                                    } else if xp + yp < 3 {
-                                        1
-                                    } else {
-                                        0
-                                    }
-                                }
-                                1 => {
-                                    if yp == 0 {
-                                        2
-                                    } else if yp == 1 {
-                                        1
-                                    } else {
-                                        0
-                                    }
-                                }
-                                2 => {
-                                    if xp == 0 {
-                                        2
-                                    } else if xp == 1 {
-                                        1
-                                    } else {
-                                        0
-                                    }
-                                }
-                                _ => 2,
-                            };
-                            if c == 0 {
-                                if xs + ys > 0 {
-                                    s += 3;
-                                }
-                                s += if log2 == 3 { if scan_idx == 0 { 9 } else { 15 } } else { 21 };
-                            } else {
-                                s += if log2 == 3 { 9 } else { 12 };
-                            }
-                            s
+                            pattern[np as usize] as usize + sig_base
                         };
                         if self.c.decode_decision(SIG_COEFF + c_off_sig + sig_ctx) == 1 {
                             sig[nsig] = np as u8;
@@ -1409,7 +1381,8 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         let n = 1usize << log2;
         let bd = if c == 0 { self.pic.bd_y } else { self.pic.bd_c };
         let coeffs = &mut self.coeffs[..n * n];
-        let mut dc_only = false;
+        // a block with only a DC coefficient: every residual sample is the same value
+        let mut dc = None;
         if !self.cu_transquant_bypass {
             // scaling (8.6.3)
             let bd_shift = bd + log2 - 5;
@@ -1423,12 +1396,21 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
                 }
                 _ => None,
             };
-            for y in 0..=max_y {
-                for x in 0..=max_x {
-                    let v = coeffs[y * n + x];
-                    if v != 0 {
-                        let f = m.map_or(16, |m| m[y * n + x] as i64);
-                        coeffs[y * n + x] = ((v as i64 * f * scale + round) >> bd_shift).clamp(-32768, 32767) as i32;
+            let scale_one = |v: i32, f: i64| ((v as i64 * f * scale + round) >> bd_shift).clamp(-32768, 32767) as i32;
+            match m {
+                // the flat default (m = 16) in its own loop: no matrix lookup per coefficient
+                None => {
+                    for row in coeffs.chunks_mut(n).take(max_y + 1) {
+                        for v in &mut row[..=max_x] {
+                            *v = scale_one(*v, 16);
+                        }
+                    }
+                }
+                Some(m) => {
+                    for (row, mrow) in coeffs.chunks_mut(n).zip(m.chunks(n)).take(max_y + 1) {
+                        for (v, &f) in row[..=max_x].iter_mut().zip(mrow) {
+                            *v = scale_one(*v, f as i64);
+                        }
                     }
                 }
             }
@@ -1436,21 +1418,27 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             if ts {
                 transform::transform_skip(coeffs, n, bd_shift);
             } else if max_x == 0 && max_y == 0 && !(self.cu_intra && c == 0 && n == 4) {
-                let v = transform::inverse_dc(coeffs[0], bd_shift);
-                coeffs.fill(v);
-                dc_only = true;
+                dc = Some(transform::inverse_dc(coeffs[0], bd_shift));
             } else {
                 let dst = self.cu_intra && c == 0 && n == 4;
                 transform::inverse_transform(coeffs, n, dst, max_x, max_y, bd_shift);
             }
         }
-        let _ = dc_only;
         let (stride, max) = (if c == 0 { self.pic.width } else { self.pic.cwidth }, (1i32 << bd) - 1);
         let plane = &mut self.pic.planes[c];
         for y in 0..n {
-            let row = &mut plane[(y0 as usize + y) * stride + x0 as usize..][..n];
-            for (x, s) in row.iter_mut().enumerate() {
-                *s = S::from_i32((s.to_i32() + coeffs[y * n + x]).clamp(0, max));
+            let Some(row) = plane.get_mut((y0 as usize + y) * stride + x0 as usize..).and_then(|r| r.get_mut(..n)) else { break };
+            match dc {
+                Some(d) => {
+                    for s in row.iter_mut() {
+                        *s = S::from_i32((s.to_i32() + d).clamp(0, max));
+                    }
+                }
+                None => {
+                    for (s, &r) in row.iter_mut().zip(&coeffs[y * n..(y + 1) * n]) {
+                        *s = S::from_i32((s.to_i32() + r).clamp(0, max));
+                    }
+                }
             }
         }
         Ok(())
