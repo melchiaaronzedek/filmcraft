@@ -1393,8 +1393,19 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         }
     }
 
-    /// Scaling, transform and addition to the prediction.
+    /// Scaling, transform and addition to the prediction (compiled per instruction set, the best
+    /// one at run time: `crate::simd`).
+    #[allow(clippy::too_many_arguments)]
     fn reconstruct(&mut self, x0: i32, y0: i32, log2: u32, c: usize, qp: i32, ts: bool, max_x: usize, max_y: usize) -> Result<()> {
+        crate::simd::run(
+            #[inline(always)]
+            || self.reconstruct_impl(x0, y0, log2, c, qp, ts, max_x, max_y),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn reconstruct_impl(&mut self, x0: i32, y0: i32, log2: u32, c: usize, qp: i32, ts: bool, max_x: usize, max_y: usize) -> Result<()> {
         let n = 1usize << log2;
         let bd = if c == 0 { self.pic.bd_y } else { self.pic.bd_c };
         let coeffs = &mut self.coeffs[..n * n];
