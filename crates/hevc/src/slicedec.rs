@@ -136,6 +136,12 @@ pub struct PicState<S> {
     pub deblocking_enabled_anywhere: bool,
     /// Draft mode: no deblocking or SAO.
     pub draft: bool,
+    /// Set when the decoder that started this picture was reset or dropped: decoding stops at
+    /// the next CTB row (the picture is then published grey).
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// The planes still hold samples of an earlier picture (a recycled state, see
+    /// [`PicState::reuse`]): CTBs no slice decoded must be filled grey before publication.
+    pub planes_dirty: bool,
 }
 
 impl<S: Sample> PicState<S> {
@@ -183,6 +189,80 @@ impl<S: Sample> PicState<S> {
             scaling,
             deblocking_enabled_anywhere: false,
             draft: false,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            planes_dirty: false,
+        }
+    }
+
+    /// Prepare a state that decoded an earlier picture for `frame`, keeping its buffers (two
+    /// planes' worth of samples and the per-4x4 arrays: tens of MB at 4K that would otherwise be
+    /// allocated, page-faulted and filled for every picture). False, and nothing changed, when
+    /// the geometry differs (another SPS): the caller then makes a new state. The sample planes are
+    /// not cleared: every sample of a decoded CTB is written before it is read, and the CTBs no
+    /// slice decoded are filled grey at the end of the picture ([`Self::fill_undecoded`]).
+    pub fn reuse(&mut self, frame: FrameRef, sps: Arc<Sps>, pps: Arc<Pps>, layout: Arc<Layout>, scaling: Option<Arc<Vec<Vec<u8>>>>) -> bool {
+        let same = sps.width as usize == self.width
+            && sps.height as usize == self.height
+            && frame.chroma == self.chroma
+            && sps.log2_ctb == self.log2_ctb
+            && sps.bit_depth_luma == self.bd_y
+            && sps.bit_depth_chroma == self.bd_c
+            && frame.cwidth == self.cwidth
+            && frame.cheight == self.cheight;
+        if !same {
+            return false;
+        }
+        self.poc = frame.poc;
+        self.frame = frame;
+        self.sps = sps;
+        self.pps = pps;
+        self.layout = layout;
+        self.scaling = scaling;
+        self.blk.fill(Blk::default());
+        self.mvf.fill(MvField::default());
+        self.ctb_slice.fill(u32::MAX);
+        self.ctb_addr.fill(u32::MAX);
+        self.sao.fill(SaoParams::default());
+        self.slices.clear();
+        self.row_done.fill(0);
+        self.rows_complete = 0;
+        self.rows_deblocked = 0;
+        self.rows_published = 0;
+        self.wpp_ctx = None;
+        self.ds_ctx = None;
+        self.deblocking_enabled_anywhere = false;
+        self.draft = false;
+        self.planes_dirty = true;
+        true
+    }
+
+    /// Fill the CTBs of rows `from..` that no slice decoded with mid-grey (a picture with missing
+    /// or undecodable slices), in a recycled state whose planes hold an earlier picture.
+    pub fn fill_undecoded(&mut self, from: usize) {
+        if !self.planes_dirty {
+            return;
+        }
+        let ctb = 1usize << self.log2_ctb;
+        let (sx, sy) = self.chroma.shifts();
+        let gy = S::from_u16(1u16 << (self.bd_y - 1));
+        let gc = S::from_u16(1u16 << (self.bd_c - 1));
+        for ry in from..self.hctb {
+            for rx in 0..self.wctb {
+                if self.ctb_slice.get(ry * self.wctb + rx).is_none_or(|&s| s != u32::MAX) {
+                    continue;
+                }
+                for c in 0..3 {
+                    let (w, h, csx, csy, g) =
+                        if c == 0 { (self.width, self.height, ctb, ctb, gy) } else { (self.cwidth, self.cheight, ctb >> sx, ctb >> sy, gc) };
+                    let (x0, y0) = (rx * csx, ry * csy);
+                    let (x1, y1) = ((x0 + csx).min(w), (y0 + csy).min(h));
+                    for y in y0..y1 {
+                        if let Some(run) = self.planes[c].get_mut(y * w + x0..y * w + x1) {
+                            run.fill(g);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -405,6 +485,9 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         let mut first = true;
         loop {
             let rs = layout.ts_to_rs[ts as usize];
+            if rs.is_multiple_of(wctb) && self.pic.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(crate::error::Error::Cancelled);
+            }
             ensure!(self.pic.ctb_slice[rs as usize] == u32::MAX, "CTB {rs} decoded twice");
             let (rx, ry) = ((rs % wctb) as i32, (rs / wctb) as i32);
             let ctb = 1i32 << self.sps.log2_ctb;

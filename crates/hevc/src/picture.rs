@@ -98,6 +98,38 @@ impl Sample for u16 {
     }
 }
 
+static PLANE_ALLOCATOR_U8: OnceLock<fn(usize) -> Vec<u8>> = OnceLock::new();
+static PLANE_ALLOCATOR_U16: OnceLock<fn(usize) -> Vec<u16>> = OnceLock::new();
+
+/// Where output planes come from: an empty buffer with room for the given number of samples, for
+/// 8-bit and for deeper pictures. The host sets them once to recycle the planes of pictures it is
+/// done with (the first call wins); without them planes are freshly allocated.
+pub fn set_plane_allocators(u8_planes: fn(usize) -> Vec<u8>, u16_planes: fn(usize) -> Vec<u16>) {
+    let _ = PLANE_ALLOCATOR_U8.set(u8_planes);
+    let _ = PLANE_ALLOCATOR_U16.set(u16_planes);
+}
+
+/// An output plane type with its allocator.
+pub trait OutSample: Copy {
+    fn alloc(len: usize) -> Vec<Self>;
+}
+
+impl OutSample for u8 {
+    fn alloc(len: usize) -> Vec<u8> {
+        let mut v = PLANE_ALLOCATOR_U8.get().copied().unwrap_or(Vec::with_capacity)(len);
+        v.clear();
+        v
+    }
+}
+
+impl OutSample for u16 {
+    fn alloc(len: usize) -> Vec<u16> {
+        let mut v = PLANE_ALLOCATOR_U16.get().copied().unwrap_or(Vec::with_capacity)(len);
+        v.clear();
+        v
+    }
+}
+
 /// Whether pictures with these bit depths are stored as `u8` (both 8-bit), else as `u16`.
 pub fn stores_u8(bit_depth: u32, bit_depth_c: u32) -> bool {
     bit_depth <= 8 && bit_depth_c <= 8
@@ -322,40 +354,45 @@ impl Frame {
     /// Crop the frame into planar buffers (waits for completion): 8-bit planes when `eight_bit`,
     /// else 16-bit ones. Rows stored in the output type are copied as they are.
     pub fn cropped_planes(&self, crop: (usize, usize, usize, usize), eight_bit: bool) -> (Plane, Plane, Plane) {
-        fn planes<S: Sample, T>(f: &Frame, crop: (usize, usize, usize, usize), conv: impl Fn(S) -> T, wrap: impl Fn(Vec<T>) -> Plane) -> (Plane, Plane, Plane) {
-            let (y, u, v) = f.copy_cropped::<S, T>(crop, conv);
+        fn planes<S: Sample, T: OutSample>(
+            f: &Frame,
+            crop: (usize, usize, usize, usize),
+            put: impl Fn(&mut Vec<T>, &[S]),
+            wrap: impl Fn(Vec<T>) -> Plane,
+        ) -> (Plane, Plane, Plane) {
+            let (y, u, v) = f.copy_cropped::<S, T>(crop, put);
             (wrap(y), wrap(u), wrap(v))
         }
+        // the stored type is the output type in practice: whole-run copies (memcpy), not a
+        // conversion per sample (which took a tenth of single-threaded 4K decoding)
         match (&self.rows, eight_bit) {
-            (Rows::U8(_), true) => planes::<u8, u8>(self, crop, |v| v, Plane::U8),
-            (Rows::U8(_), false) => planes::<u8, u16>(self, crop, u16::from, Plane::U16),
+            (Rows::U8(_), true) => planes::<u8, u8>(self, crop, |o, s| o.extend_from_slice(s), Plane::U8),
+            (Rows::U8(_), false) => planes::<u8, u16>(self, crop, |o, s| o.extend(s.iter().map(|&v| u16::from(v))), Plane::U16),
             // (8-bit luma with deeper chroma: the 8-bit output keeps the low bits, as before)
-            (Rows::U16(_), true) => planes::<u16, u8>(self, crop, |v| v as u8, Plane::U8),
-            (Rows::U16(_), false) => planes::<u16, u16>(self, crop, |v| v, Plane::U16),
+            (Rows::U16(_), true) => planes::<u16, u8>(self, crop, |o, s| o.extend(s.iter().map(|&v| v as u8)), Plane::U8),
+            (Rows::U16(_), false) => planes::<u16, u16>(self, crop, |o, s| o.extend_from_slice(s), Plane::U16),
         }
     }
 
-    /// The cropped planes of the frame converted sample by sample with `conv` (a plain copy for
-    /// the identity).
-    fn copy_cropped<S: Sample, T>(&self, crop: (usize, usize, usize, usize), conv: impl Fn(S) -> T) -> (Vec<T>, Vec<T>, Vec<T>) {
+    /// The cropped planes of the frame, each run of samples appended by `put` (a plain copy or a
+    /// conversion).
+    fn copy_cropped<S: Sample, T: OutSample>(&self, crop: (usize, usize, usize, usize), put_run: impl Fn(&mut Vec<T>, &[S])) -> (Vec<T>, Vec<T>, Vec<T>) {
         let (cx, cy, cw, ch) = crop;
         let ctb = 1usize << self.log2_ctb;
-        let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+        let (sw, sh) = (self.chroma.sub_width(), self.chroma.sub_height());
+        let (ccw, cch) = (cw.div_ceil(sw), ch.div_ceil(sh));
+        let (mut y, mut u, mut v) = (T::alloc(cw.saturating_mul(ch)), T::alloc(ccw.saturating_mul(cch)), T::alloc(ccw.saturating_mul(cch)));
         let put = |o: &mut Vec<T>, plane: &[S], off: usize, n: usize| {
             if let Some(s) = plane.get(off..off.saturating_add(n)) {
-                o.extend(s.iter().map(|&v| conv(v)));
+                put_run(o, s);
             }
         };
-        y.reserve_exact(cw.saturating_mul(ch));
         for r in cy..cy.saturating_add(ch) {
             let Some(row) = self.row::<S>(r / ctb) else { break };
             put(&mut y, &row.y, (r % ctb) * self.width + cx, cw);
         }
-        let (sw, sh) = (self.chroma.sub_width(), self.chroma.sub_height());
-        let (ccx, ccy, ccw, cch) = (cx / sw, cy / sh, cw.div_ceil(sw), ch.div_ceil(sh));
+        let (ccx, ccy) = (cx / sw, cy / sh);
         let cctb = ctb / sh;
-        u.reserve_exact(ccw.saturating_mul(cch));
-        v.reserve_exact(ccw.saturating_mul(cch));
         for r in ccy..ccy.saturating_add(cch) {
             let Some(row) = self.row::<S>(r / cctb) else { break };
             let o = (r % cctb) * self.cwidth + ccx;

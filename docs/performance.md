@@ -80,6 +80,55 @@ What remains per live decoder is unchanged: the H.264 decoder publishes each mac
 picture as its own allocations (`Frame::make_row`, five per row), which is where the 290 MB per
 decoder comes from.
 
+## Memory governor: two 4K 10-bit 4:2:2 clips on a 16 GB laptop (MEM5)
+
+Two Fujifilm X-S20 clips (HEVC Main 4:2:2 10, 3840x2160, decoded in software: VA-API declines
+4:2:2) stacked or cut back to back made the process reach 6.8 GB, and with a browser open the
+machine swapped until the app was killed. Every budget was fixed for one workload, none knew how
+much RAM the machine has, and Settings ▸ Memory ▸ "RAM reserved for other applications" was read
+by nothing. Measured with `bench_playback --scenario files-stack|files-seq --media a.mov,b.mov`
+(Ryzen 7 7730U, 16 threads, 15 GB, Radeon iGPU, GPU path, 9 s per play):
+
+| Two 4K 4:2:2 10-bit clips | before | after |
+|---|---|---|
+| stacked (V1 + V2), peak resident | 6.8 GB | 3.9 GB |
+| back to back, peak resident | 5.6 GB | 3.3 GB |
+| back to back, monitor at 1/4 (a laptop-sized Program monitor), frames on time | 10 % | 92 % |
+
+What changed:
+
+1. **`filmcraft_frame::memory`**: total and available RAM (`/proc/meminfo` on Linux; a host may
+   register a reader elsewhere), the reserve from Settings ▸ Memory, and a share of the rest per
+   cache (`Budget`), halved while less than a tenth of the RAM (at least 1 GiB) is available.
+   `memory_housekeeping` (once a second from the UI) frees the idle recycled buffers then.
+2. **Decoded frames** (`gop.rs`): the caches in use share `Budget::DECODED_FRAMES` (12 %) instead
+   of each keeping 64 frames: each keeps its share, at least `FLOOR_FRAMES` (16, the playback
+   lookahead) and at most 64. At 4K 10-bit 4:2:2 that is 33 MB a frame: 2.1 GB per clip before.
+3. **Decoders**: HEVC and H.264 limit their pictures in flight to `Budget::DECODER` (4 %, about
+   0.5 GB at 4K 4:2:2: six pictures). Frame threading scales sub-linearly, so this is *faster*
+   (21.4 vs 19.8 fps on the X-S20 clip, 16 threads) and the decoder peaks at 0.75 instead of
+   1.84 GB. A seek (`HevcDecoder::reset`) keeps the thread pool and stops the pictures in flight at
+   their next CTB row instead of building a new 16-thread pool while the old jobs decoded on; per
+   picture decoding states are reused (`PicState::reuse`) and output planes come from the plane
+   pool. Background decoders (thumbnails) get 2 threads.
+4. **Thumbnails of a playing clip** decode privately and only the picture at the GOP's sync
+   sample: they no longer move the playing decoder (which then seeked back) or its eviction
+   window. The timeline asks for no new thumbnails while playing.
+5. **GPU path**: playback plans are prepared from planes box-filtered to twice the size drawn
+   (`with_reduced_resolution`; a 4K clip in a monitor drawn at 1/4 uploads 1/4 of the samples), and
+   a paused frame is rendered again in full. The plan cache (`Budget::PLANS`), the GPU upload cache
+   (`Budget::GPU_UPLOADS`, by bytes, keeping the 8 newest) and the display cache
+   (`Budget::DISPLAY`, within Settings ▸ Memory) follow the governor.
+6. **Leaks**: a dropped `FrameServer` (a project opened) stops its workers, which kept its caches
+   and the previous project's media pool alive for good; thumbnail textures are capped at 400; the
+   audio packet caches are bounded by bytes (16 MB per stream; camera PCM stored one chunk per
+   sample made 4096 packets gigabytes); render previews are read in place; the hybrid decoder
+   drops its replay log once it continues in software.
+
+The HEVC software decoder remains the limit for 4K 4:2:2 (about 22 fps on this CPU, ffmpeg ~105):
+two such clips at once cannot play in real time without proxies, and the Program monitor now says
+so and offers to create them.
+
 ## Results (CPU compositor: layer rectangles, an opaque bottom layer and recycled images, before → after)
 
 The CPU compositor is what export runs. In a profile of a 9:29 export it took about a third of the

@@ -62,6 +62,8 @@ struct Uploaded {
     alpha_scale: f32,
     chroma: (u32, u32),
     last_used: u64,
+    /// Bytes of its textures (on integrated GPUs, system RAM).
+    bytes: usize,
     /// The uploaded pixel buffers, kept alive while cached: the cache key is the buffer address,
     /// and a freed buffer's address can be reused by a different frame (stale texture).
     _pixels: PixelData,
@@ -240,6 +242,31 @@ fn codes_to_f16_bytes(v: &[u16], bits: u32) -> Vec<u8> {
         }
     });
     out
+}
+
+/// Uploaded frames kept at most (enough for several stacked layers + playback lookahead).
+const MAX_UPLOADS: usize = 24;
+
+/// Uploaded frames always kept, whatever their size: the layers of the frame being drawn.
+const KEEP_UPLOADS: usize = 8;
+
+/// Bytes of the textures a frame uploads as.
+fn texture_bytes(f: &VideoFrame) -> usize {
+    let (w, h) = (f.width as usize, f.height as usize);
+    let full = w.saturating_mul(h);
+    match &f.data {
+        PixelData::Rgba8(_) => full.saturating_mul(4),
+        PixelData::RgbaF32(_) => full.saturating_mul(8),
+        PixelData::Yuv8 { chroma, alpha, .. } => yuv_bytes(w, h, *chroma, alpha.is_some(), 1),
+        PixelData::Yuv16 { chroma, alpha, .. } => yuv_bytes(w, h, *chroma, alpha.is_some(), 2),
+    }
+}
+
+fn yuv_bytes(w: usize, h: usize, chroma: Chroma, alpha: bool, per_sample: usize) -> usize {
+    let full = w.saturating_mul(h);
+    let (sx, sy) = chroma.shifts();
+    let chroma_samples = 2usize.saturating_mul(w.div_ceil(1 << sx)).saturating_mul(h.div_ceil(1 << sy));
+    full.saturating_add(chroma_samples).saturating_add(if alpha { full } else { 0 }).saturating_mul(per_sample)
 }
 
 /// Convert a frame's texels for upload (None when it uploads as it is).
@@ -504,6 +531,7 @@ impl GpuCompositor {
                     alpha_scale: 0.0,
                     chroma: (w, h),
                     last_used: self.clock,
+                    bytes: 0,
                     _pixels: f.data.clone(),
                 }
             }
@@ -524,6 +552,7 @@ impl GpuCompositor {
                     alpha_scale: 0.0,
                     chroma: (w, h),
                     last_used: self.clock,
+                    bytes: 0,
                     _pixels: f.data.clone(),
                 }
             }
@@ -542,6 +571,7 @@ impl GpuCompositor {
                     alpha_scale,
                     chroma: (cw, ch),
                     last_used: self.clock,
+                    bytes: 0,
                     _pixels: f.data.clone(),
                 }
             }
@@ -571,20 +601,43 @@ impl GpuCompositor {
                     alpha_scale,
                     chroma: (cw, ch),
                     last_used: self.clock,
+                    bytes: 0,
                     _pixels: f.data.clone(),
                 }
             }
         };
+        let mut up = up;
+        up.bytes = texture_bytes(f);
         self.uploads.insert(key, up);
-        // keep the most recent uploads (enough for several stacked layers + playback lookahead)
-        if self.uploads.len() > 24 {
-            let mut v: Vec<(u64, (usize, u32, u32))> = self.uploads.iter().map(|(k, u)| (u.last_used, *k)).collect();
-            v.sort_unstable();
-            for (_, k) in v.into_iter().take(self.uploads.len() - 24) {
-                self.uploads.remove(&k);
-            }
-        }
+        self.trim_uploads();
         key
+    }
+
+    /// Keep the most recent uploads: at most [`MAX_UPLOADS`] and the memory governor's share of
+    /// bytes (24 4K 10-bit frames were ~800 MB of textures, system RAM on an integrated GPU), but
+    /// always the [`KEEP_UPLOADS`] newest, so the layers of the frame being drawn stay.
+    fn trim_uploads(&mut self) {
+        let budget = filmcraft_frame::memory::Budget::GPU_UPLOADS.bytes();
+        let mut total: usize = self.uploads.values().map(|u| u.bytes).sum();
+        if self.uploads.len() <= KEEP_UPLOADS || (self.uploads.len() <= MAX_UPLOADS && total <= budget) {
+            return;
+        }
+        let mut v: Vec<(u64, (usize, u32, u32), usize)> = self.uploads.iter().map(|(k, u)| (u.last_used, *k, u.bytes)).collect();
+        v.sort_unstable();
+        let mut left = v.len();
+        for (_, k, b) in v {
+            if left <= KEEP_UPLOADS || (left <= MAX_UPLOADS && total <= budget) {
+                break;
+            }
+            self.uploads.remove(&k);
+            total = total.saturating_sub(b);
+            left -= 1;
+        }
+    }
+
+    /// (uploaded frames cached, their texture bytes) (`perf.stats`).
+    pub fn upload_cache(&self) -> (usize, usize) {
+        (self.uploads.len(), self.uploads.values().map(|u| u.bytes).sum())
     }
 
     /// The source description of an uploaded frame.

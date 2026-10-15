@@ -282,6 +282,8 @@ impl H264Decoder {
 
     fn make_inner(avcc: &[u8], threads: usize) -> Result<filmcraft_h264::Decoder> {
         let mut dec = filmcraft_h264::Decoder::with_threads(threads);
+        // pictures in flight within the memory governor's decoder budget (see `HevcDecoder`)
+        dec.set_memory_limit(Some(filmcraft_frame::memory::Budget::DECODER.bytes()));
         if !avcc.is_empty() {
             dec.configure_avcc(avcc).map_err(h264_error)?;
         }
@@ -299,7 +301,8 @@ impl H264Decoder {
     pub fn annexb() -> Self {
         recycle_h264_planes();
         let threads = Self::threads_now();
-        Self { avcc: Vec::new(), dec: filmcraft_h264::Decoder::with_threads(threads), length_size: 0, draft: false, threads }
+        let dec = Self::make_inner(&[], threads).unwrap_or_else(|_| filmcraft_h264::Decoder::with_threads(threads));
+        Self { avcc: Vec::new(), dec, length_size: 0, draft: false, threads }
     }
     fn convert(p: filmcraft_h264::Picture) -> DecodedFrame {
         use std::sync::Arc;
@@ -389,21 +392,54 @@ pub fn h264_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
 
 /// Our pure-Rust HEVC decoder (Main / Main 10 / Main 4:2:2 10, frame-threaded).
 pub struct HevcDecoder {
-    hvcc: Vec<u8>,
     dec: filmcraft_hevc::Decoder,
     length_size: usize,
     highest_tid: Option<u8>,
+    /// Worker threads (a background decoder gets fewer).
+    threads: usize,
+}
+
+/// Worker threads of the HEVC decoders made for background work (thumbnails), as for H.264.
+const BACKGROUND_HEVC_THREADS: usize = 2;
+
+/// Worker threads each HEVC decoder uses for playback (frame threading; 1 on wasm).
+pub fn hevc_threads() -> usize {
+    filmcraft_h264::default_threads()
 }
 
 impl HevcDecoder {
+    /// The worker threads for a decoder made now.
+    fn threads_now() -> usize {
+        if filmcraft_media::cancel::background() { BACKGROUND_HEVC_THREADS.min(hevc_threads()) } else { hevc_threads() }
+    }
+
+    /// A decoder with `threads` workers whose pictures in flight stay within the memory governor's
+    /// decoder budget (`filmcraft_frame::memory`): at 4K 10-bit 4:2:2 the default `threads + 2`
+    /// pictures of a 16-thread decoder took ~1.8 GB, and six (~0.5 GB) decode as fast.
+    fn make_inner(hvcc: &[u8], threads: usize) -> Result<filmcraft_hevc::Decoder> {
+        filmcraft_hevc::set_plane_allocators(filmcraft_frame::pool::take_u8, filmcraft_frame::pool::take_u16);
+        let mut dec = filmcraft_hevc::Decoder::with_threads(threads);
+        dec.set_memory_limit(Some(filmcraft_frame::memory::Budget::DECODER.bytes()));
+        if !hvcc.is_empty() {
+            dec.configure_hvcc(hvcc).map_err(hevc_error)?;
+        }
+        Ok(dec)
+    }
+
     pub fn new(hvcc: Vec<u8>) -> Result<Self> {
-        let dec = filmcraft_hevc::Decoder::from_hvcc(&hvcc).map_err(hevc_error)?;
+        let threads = Self::threads_now();
+        let dec = Self::make_inner(&hvcc, threads)?;
         let (length_size, highest_tid) = hvcc_length_size_and_tid(&hvcc);
-        Ok(Self { hvcc, dec, length_size, highest_tid })
+        Ok(Self { dec, length_size, highest_tid, threads })
     }
     /// A decoder for Annex B byte-stream samples (start codes, in-band parameter sets: TS).
     pub fn annexb() -> Self {
-        Self { hvcc: Vec::new(), dec: filmcraft_hevc::Decoder::new(), length_size: 0, highest_tid: None }
+        let threads = Self::threads_now();
+        let dec = match Self::make_inner(&[], threads) {
+            Ok(d) => d,
+            Err(_) => filmcraft_hevc::Decoder::with_threads(threads),
+        };
+        Self { dec, length_size: 0, highest_tid: None, threads }
     }
     fn convert(p: filmcraft_hevc::Picture) -> DecodedFrame {
         use filmcraft_hevc::Plane;
@@ -458,14 +494,17 @@ impl VideoDecoder for HevcDecoder {
         self.dec.flush().into_iter().map(Self::convert).collect()
     }
     fn reset(&mut self) {
-        if self.hvcc.is_empty() {
-            self.dec = filmcraft_hevc::Decoder::new();
-        } else if let Ok(d) = filmcraft_hevc::Decoder::from_hvcc(&self.hvcc) {
-            self.dec = d;
-        }
+        // A seek: keep the thread pool and parameter sets, abandon the pictures in flight (they
+        // stop at their next CTB row instead of decoding on beside the new position), and follow
+        // the memory governor's current decoder budget (smaller while the machine is short).
+        self.dec.reset();
+        self.dec.set_memory_limit(Some(filmcraft_frame::memory::Budget::DECODER.bytes()));
     }
     fn name(&self) -> &str {
         "FilmCraft HEVC"
+    }
+    fn thread_limited(&self) -> bool {
+        self.threads < hevc_threads()
     }
     fn is_disposable(&self, sample: &[u8]) -> bool {
         hevc_disposable(sample, self.length_size, self.highest_tid)

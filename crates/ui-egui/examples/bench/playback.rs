@@ -104,6 +104,53 @@ pub fn build_sequence_fx(s: &mut Session, w: u32, h: u32, layers: &[(ItemId, f64
     .expect("sequence")
 }
 
+/// The media files of the `files-stack` / `files-seq` scenarios (`--media a.mov,b.mov`, or the
+/// `FILMCRAFT_BENCH_MEDIA` environment variable): real camera clips instead of generated fixtures.
+static MEDIA: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+fn bench_media() -> Vec<std::path::PathBuf> {
+    MEDIA
+        .get_or_init(|| {
+            std::env::var("FILMCRAFT_BENCH_MEDIA").map(|v| v.split(',').filter(|p| !p.is_empty()).map(std::path::PathBuf::from).collect()).unwrap_or_default()
+        })
+        .clone()
+}
+
+/// The clips one after another on V1 (each for `secs`, its own length if shorter).
+pub fn build_sequence_seq(s: &mut Session, w: u32, h: u32, items: &[ItemId], secs: f64) -> ItemId {
+    let rate = FrameRate::FPS_23_976;
+    s.edit("bench sequence", |p: &mut Project, st| {
+        let settings = SequenceSettings { width: w, height: h, frame_rate: rate, ..SequenceSettings::default() };
+        let seq = p.new_sequence("Bench", settings, 1, 1, None);
+        let mut at = Tick::ZERO;
+        for &item in items {
+            let dur = match p.item(item).map(|i| &i.kind) {
+                Some(filmcraft_project::ItemKind::Media(m)) => m.info.duration.min(Tick::from_seconds_f64(secs)),
+                _ => Tick::from_seconds_f64(secs),
+            };
+            let range = TimeRange::new(Tick::ZERO, rate.snap(dur));
+            let v = p.make_track_item(item, TrackKind::Video, at, range, rate).expect("track item");
+            at += rate.snap(dur);
+            p.sequence_mut(seq).expect("seq").video_tracks[0].items.push(v);
+        }
+        st.active_sequence = Some(seq);
+        st.open_sequences = vec![seq];
+        st.playheads.insert(seq, Tick::ZERO);
+        Ok(seq)
+    })
+    .expect("sequence")
+}
+
+/// Resident and peak resident memory and swap of this process (MB), from /proc (Linux; zeros
+/// elsewhere).
+pub fn memory_mb() -> (f64, f64, f64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| -> f64 {
+        status.lines().find(|l| l.starts_with(name)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / 1024.0
+    };
+    (field("VmRSS:"), field("VmHWM:"), field("VmSwap:"))
+}
+
 // ------------------------------------------------------------------------------------ display
 
 /// The UI side of a monitor: presents the frame it gets (GPU composite or texture conversion)
@@ -644,9 +691,13 @@ fn parse_args() -> Args {
             "--workers" => a.workers = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.workers),
             "--repeat" => a.repeat = it.next().and_then(|v| v.parse().ok()).unwrap_or(1),
             "--json" => a.json = it.next(),
+            "--media" => {
+                let v: Vec<std::path::PathBuf> = it.next().unwrap_or_default().split(',').filter(|p| !p.is_empty()).map(std::path::PathBuf::from).collect();
+                let _ = MEDIA.set(v);
+            }
             "--help" | "-h" => {
                 println!(
-                    "bench_playback [--scenario h264-1080,stack3,stack3-blend,stack3-fx,h264-2160,hevc-2160,vp9-2160,av1-2160,demo,after-preview,seek-storm] [--res full,half] [--cpu|--gpu] [--seconds 8] [--refresh 60] [--workers N] [--repeat N] [--json out.json]"
+                    "bench_playback [--scenario h264-1080,stack3,stack3-blend,stack3-fx,h264-2160,hevc-2160,vp9-2160,av1-2160,demo,after-preview,seek-storm,files-stack,files-seq] [--media a.mov,b.mov] [--res full,half] [--cpu|--gpu] [--seconds 8] [--refresh 60] [--workers N] [--repeat N] [--json out.json]"
                 );
                 std::process::exit(0);
             }
@@ -755,6 +806,29 @@ pub fn scenario_session(name: &str) -> Option<(Session, ItemId)> {
             s.execute("file.openDemoProject", json!({})).ok()?;
             s.state.active_sequence?
         }
+        "files-stack" | "files-seq" => {
+            let media = bench_media();
+            if media.is_empty() {
+                eprintln!("{name}: give the clips with --media a.mov,b.mov");
+                return None;
+            }
+            let items: Vec<ItemId> = media.iter().map(|p| import(&mut s, p)).collect();
+            let (w, h) = match s.project.item(items[0]).map(|i| &i.kind) {
+                Some(filmcraft_project::ItemKind::Media(m)) => m.info.video.as_ref().map(|v| (v.width, v.height)).unwrap_or((1920, 1080)),
+                _ => (1920, 1080),
+            };
+            if name == "files-seq" {
+                build_sequence_seq(&mut s, w, h, &items, 10.0)
+            } else {
+                // V1 full frame, the others as picture-in-picture at 50 %
+                let layers: Vec<(ItemId, f64, Option<(f64, f64)>, f64, f64)> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &it)| if i == 0 { (it, 100.0, None, 0.0, 100.0) } else { (it, 50.0, Some((w as f64 * 0.7, h as f64 * 0.7)), 0.0, 100.0) })
+                    .collect();
+                build_sequence(&mut s, w, h, &layers, &[], 10.0)
+            }
+        }
         _ => {
             eprintln!("unknown scenario {name}");
             return None;
@@ -825,6 +899,19 @@ pub fn cli_main() {
                     print_row(r, fps);
                     out.push(to_json(r, name, res_name, path));
                 }
+                let (rss, peak, swap) = memory_mb();
+                println!("    memory after {name} {res_name}: resident {rss:.0} MB, peak resident {peak:.0} MB, swap {swap:.0} MB");
+                let (imgs, img_bytes, plans, plan_bytes) = bench.server.cache_entries();
+                let pool = filmcraft_frame::pool::stats();
+                println!(
+                    "    caches: decoded frames {:.0} MB (budget {:.0} MB, {} live decoders), plans {plans} / {:.0} MB, images {imgs} / {:.0} MB, idle buffers {:.0} MB",
+                    filmcraft_codecs::cached_bytes() as f64 / 1e6,
+                    filmcraft_codecs::frame_budget() as f64 / 1e6,
+                    filmcraft_codecs::live_decoders(),
+                    plan_bytes as f64 / 1e6,
+                    img_bytes as f64 / 1e6,
+                    pool.idle_bytes as f64 / 1e6
+                );
             }
         }
     }

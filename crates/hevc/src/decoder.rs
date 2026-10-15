@@ -14,7 +14,8 @@ use crate::slicedec::{Blk, F_INTRA, F_SKIP, PicState, SliceDecoder, SliceJob};
 use crate::{ChromaFormat, ColorInfo, Picture};
 use filmcraft_bitstream::{annexb_nals, length_prefixed_nals, unescape_rbsp};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// A picture whose slices are being collected.
 struct PendingPic {
@@ -64,6 +65,40 @@ pub struct DecodeStats {
 struct Shared {
     error: Mutex<Option<Error>>,
     stats: Mutex<DecodeStats>,
+    /// Per-picture decoding states of finished jobs, reused by later pictures (see
+    /// [`PicState::reuse`]).
+    states_u8: Mutex<Vec<PicState<u8>>>,
+    states_u16: Mutex<Vec<PicState<u16>>>,
+}
+
+/// Recycled per-picture states kept per decoder: enough for the jobs that start while others
+/// finish, without holding many idle full-picture buffers.
+const KEEP_STATES: usize = 2;
+
+/// The recycled states of the sample type `S`.
+trait StatePool: Sample {
+    fn states(shared: &Shared) -> &Mutex<Vec<PicState<Self>>>;
+}
+
+impl StatePool for u8 {
+    fn states(shared: &Shared) -> &Mutex<Vec<PicState<u8>>> {
+        &shared.states_u8
+    }
+}
+
+impl StatePool for u16 {
+    fn states(shared: &Shared) -> &Mutex<Vec<PicState<u16>>> {
+        &shared.states_u16
+    }
+}
+
+/// Bytes one picture in flight holds: its published rows, the decoding state's reconstruction
+/// planes (as large) and the per-4x4-block arrays (about one byte per luma sample).
+pub fn bytes_in_flight(width: usize, height: usize, chroma: ChromaFormat, bit_depth: u32) -> usize {
+    let (sx, sy) = chroma.shifts();
+    let samples = width.saturating_mul(height).saturating_add(2usize.saturating_mul(width >> sx).saturating_mul(height >> sy));
+    let per_sample = if bit_depth > 8 { 2 } else { 1 };
+    samples.saturating_mul(per_sample).saturating_mul(2).saturating_add(width.saturating_mul(height))
 }
 
 /// H.265 / HEVC decoder.
@@ -88,7 +123,22 @@ pub struct Decoder {
     pool: Option<rayon::ThreadPool>,
     in_flight: VecDeque<FrameRef>,
     max_in_flight: usize,
+    /// Bytes the pictures in flight may hold together ([`Decoder::set_memory_limit`]).
+    memory_limit: Option<usize>,
+    /// Pictures in flight allowed for the current stream: `max_in_flight`, or fewer when the
+    /// memory limit says so for its picture size.
+    in_flight_cap: usize,
+    /// Shared with the jobs started since the last reset: set to stop them.
+    cancel: Arc<AtomicBool>,
     draft: bool,
+}
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        // the jobs still queued or running on the pool stop at their next CTB row instead of
+        // decoding pictures nobody will output
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Default for Decoder {
@@ -142,8 +192,63 @@ impl Decoder {
             pool,
             in_flight: VecDeque::new(),
             max_in_flight: threads.max(1) + 2,
+            memory_limit: None,
+            in_flight_cap: threads.max(1) + 2,
+            cancel: Arc::new(AtomicBool::new(false)),
             draft: false,
         }
+    }
+
+    /// Limit the memory of the pictures decoded in parallel (frame threading) to about `bytes`:
+    /// each picture in flight holds two full-picture buffers, so at 4K 10-bit 4:2:2 the default
+    /// `threads + 2` pictures of a 16-thread decoder take ~1.4 GB. Fewer pictures in flight cost
+    /// little speed (frame threading scales sub-linearly) and at least two always run. `None`:
+    /// no limit (the default).
+    pub fn set_memory_limit(&mut self, bytes: Option<usize>) {
+        self.memory_limit = bytes;
+        self.in_flight_cap = self.max_in_flight;
+        if let Some(sps) = self.active_sps.clone() {
+            self.update_in_flight_cap(&sps);
+        }
+    }
+
+    /// Pictures in flight allowed for pictures of `sps`, after the memory limit.
+    fn update_in_flight_cap(&mut self, sps: &Sps) {
+        self.in_flight_cap = match (self.memory_limit, ChromaFormat::from_idc(sps.chroma_array_type())) {
+            (Some(limit), Some(chroma)) => {
+                let per = bytes_in_flight(sps.width as usize, sps.height as usize, chroma, sps.bit_depth_luma.max(sps.bit_depth_chroma)).max(1);
+                (limit / per).clamp(2, self.max_in_flight.max(2))
+            }
+            _ => self.max_in_flight,
+        };
+    }
+
+    /// Pictures that may be in flight now (see [`Decoder::set_memory_limit`]).
+    pub fn in_flight_limit(&self) -> usize {
+        self.in_flight_cap
+    }
+
+    /// Forget the stream position (a seek): pictures in flight are abandoned (their jobs stop at
+    /// the next CTB row), the DPB, reordering and output queues are emptied, and decoding starts
+    /// again at the next random-access picture. Parameter sets, the thread pool, the memory limit
+    /// and the draft setting are kept, so a seek costs no new threads.
+    pub fn reset(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel = Arc::new(AtomicBool::new(false));
+        let stats = self.stats();
+        self.shared = Arc::new(Shared::default());
+        if let Ok(mut s) = self.shared.stats.lock() {
+            *s = stats;
+        }
+        self.pending = None;
+        self.dpb = Dpb::default();
+        self.poc_state = PocState::default();
+        self.out_queue.clear();
+        self.in_flight.clear();
+        self.active_sps = None;
+        self.first_picture = true;
+        self.after_eos = false;
+        self.skip_rasl = false;
     }
 
     /// Configure from an `hvcC` (HEVCDecoderConfigurationRecord) box payload.
@@ -202,7 +307,7 @@ impl Decoder {
             result = result.and(Err(e));
         }
         result?;
-        let max_queue = self.max_in_flight * 2;
+        let max_queue = self.in_flight_cap * 2;
         let mut pics = Vec::new();
         while let Some(o) = self.out_queue.front() {
             if !o.frame.is_complete() && self.out_queue.len() <= max_queue {
@@ -390,6 +495,9 @@ impl Decoder {
         if changed && self.active_sps.is_some() {
             self.dpb.flush(&mut outs);
         }
+        if changed {
+            self.update_in_flight_cap(sps);
+        }
         self.active_sps = Some(sps.clone());
         self.dpb.max_dec_pic_buffering = sps.max_dec_pic_buffering as usize;
         self.dpb.max_num_reorder = sps.max_num_reorder as usize;
@@ -495,19 +603,20 @@ impl Decoder {
         draft: bool,
     ) {
         let shared = self.shared.clone();
+        let cancel = self.cancel.clone();
         #[cfg(feature = "threads")]
         if let Some(pool) = &self.pool {
             self.in_flight.retain(|f| !f.is_complete());
-            while self.in_flight.len() >= self.max_in_flight {
+            while self.in_flight.len() >= self.in_flight_cap {
                 if let Some(f) = self.in_flight.pop_front() {
                     f.wait_complete();
                 }
             }
             self.in_flight.push_back(frame.clone());
-            pool.spawn_fifo(move || run_job(frame, sps, pps, layout, scaling, slices, draft, &shared));
+            pool.spawn_fifo(move || run_job(frame, sps, pps, layout, scaling, slices, draft, &shared, cancel));
             return;
         }
-        run_job(frame, sps, pps, layout, scaling, slices, draft, &shared);
+        run_job(frame, sps, pps, layout, scaling, slices, draft, &shared, cancel);
     }
 }
 
@@ -522,16 +631,17 @@ fn run_job(
     slices: Vec<SliceJob>,
     draft: bool,
     shared: &Shared,
+    cancel: Arc<AtomicBool>,
 ) {
     if stores_u8(frame.bit_depth, frame.bit_depth_c) {
-        run_job_as::<u8>(frame, sps, pps, layout, scaling, slices, draft, shared)
+        run_job_as::<u8>(frame, sps, pps, layout, scaling, slices, draft, shared, cancel)
     } else {
-        run_job_as::<u16>(frame, sps, pps, layout, scaling, slices, draft, shared)
+        run_job_as::<u16>(frame, sps, pps, layout, scaling, slices, draft, shared, cancel)
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_job_as<S: Sample>(
+fn run_job_as<S: StatePool>(
     frame: FrameRef,
     sps: Arc<Sps>,
     pps: Arc<Pps>,
@@ -540,25 +650,58 @@ fn run_job_as<S: Sample>(
     slices: Vec<SliceJob>,
     draft: bool,
     shared: &Shared,
+    cancel: Arc<AtomicBool>,
 ) {
-    let mut pic = PicState::<S>::new(frame.clone(), sps, pps, layout, scaling);
+    if cancel.load(Ordering::Relaxed) {
+        // the decoder was reset or dropped before this picture started: nothing waits for it but
+        // pictures abandoned with it, which must not block on its rows
+        frame.publish_gray();
+        return;
+    }
+    let recycled = S::states(shared).lock().unwrap_or_else(PoisonError::into_inner).pop();
+    let mut pic = match recycled {
+        Some(mut st) => {
+            if st.reuse(frame.clone(), sps.clone(), pps.clone(), layout.clone(), scaling.clone()) {
+                st
+            } else {
+                drop(st);
+                PicState::<S>::new(frame.clone(), sps, pps, layout, scaling)
+            }
+        }
+        None => PicState::<S>::new(frame.clone(), sps, pps, layout, scaling),
+    };
     pic.draft = draft;
+    pic.cancel = cancel.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut first_err = None;
         for s in &slices {
             if let Err(e) = SliceDecoder::decode(&mut pic, s) {
                 first_err.get_or_insert(e);
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
             }
         }
+        if cancel.load(Ordering::Relaxed) {
+            return Some(Error::Cancelled);
+        }
+        let from = pic.rows_complete;
+        pic.fill_undecoded(from);
         crate::filter::finish(&mut pic);
         first_err
     }));
-    let err = match result {
-        Ok(e) => e,
+    let (err, done) = match result {
+        Ok(Some(Error::Cancelled)) => {
+            // abandoned by a reset: publish what is left grey (nothing outputs this picture) and
+            // report nothing
+            frame.publish_gray();
+            (None, false)
+        }
+        Ok(e) => (e, true),
         Err(_) => {
             // make sure readers never block on this frame
             frame.publish_gray();
-            Some(Error::Invalid("internal error while decoding a picture".into()))
+            (Some(Error::Invalid("internal error while decoding a picture".into())), false)
         }
     };
     if let Ok(mut s) = shared.stats.lock() {
@@ -570,6 +713,13 @@ fn run_job_as<S: Sample>(
     }
     if let (Some(e), Ok(mut slot)) = (err, shared.error.lock()) {
         slot.get_or_insert(e);
+    }
+    if done {
+        // its buffers serve a later picture (a state a panic left behind is dropped instead)
+        let mut states = S::states(shared).lock().unwrap_or_else(PoisonError::into_inner);
+        if states.len() < KEEP_STATES {
+            states.push(pic);
+        }
     }
 }
 

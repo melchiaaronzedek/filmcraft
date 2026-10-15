@@ -18,8 +18,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::{PixelData, VideoFrame};
 
-/// Bytes of idle buffers kept per sample type; a buffer that does not fit is freed.
-const MAX_BYTES: usize = 192 << 20;
+/// Bytes of idle buffers kept per sample type; a buffer that does not fit is freed. From the
+/// memory governor: 192 MB on a 16 GB machine, less while it is short of memory.
+fn max_bytes() -> usize {
+    crate::memory::Budget::IDLE_BUFFERS.bytes().min(192 << 20)
+}
 
 /// Smaller buffers are not worth keeping (the allocator recycles those well).
 const MIN_BYTES: usize = 64 << 10;
@@ -71,8 +74,11 @@ static REUSED: AtomicU64 = AtomicU64::new(0);
 /// whoever overwrites every element gets it back without a zero-fill pass over tens of megabytes.
 static F32: Mutex<Vec<Vec<f32>>> = Mutex::new(Vec::new());
 
-/// Bytes of idle float images kept; a buffer that does not fit is freed.
-const F32_MAX_BYTES: usize = 320 << 20;
+/// Bytes of idle float images kept; a buffer that does not fit is freed (less while the machine
+/// is short of memory).
+fn f32_max_bytes() -> usize {
+    crate::memory::Budget::IDLE_BUFFERS.bytes()
+}
 
 fn take<T>(shelf: &Mutex<Shelf<T>>, len: usize) -> Vec<T> {
     let found = shelf.lock().unwrap_or_else(PoisonError::into_inner).take(len);
@@ -88,7 +94,7 @@ fn take<T>(shelf: &Mutex<Shelf<T>>, len: usize) -> Vec<T> {
 fn give<T>(shelf: &Mutex<Shelf<T>>, plane: Arc<Vec<T>>) {
     // a plane something else still shows (a monitor, a GPU upload in flight) is theirs
     if let Ok(b) = Arc::try_unwrap(plane) {
-        shelf.lock().unwrap_or_else(PoisonError::into_inner).give(b, MAX_BYTES);
+        shelf.lock().unwrap_or_else(PoisonError::into_inner).give(b, max_bytes());
     }
 }
 
@@ -124,7 +130,7 @@ pub fn recycle_f32(buf: Vec<f32>) {
     }
     let mut idle = F32.lock().unwrap_or_else(PoisonError::into_inner);
     let held: usize = idle.iter().map(|b| b.len().saturating_mul(4)).sum();
-    if held.saturating_add(bytes) <= F32_MAX_BYTES {
+    if held.saturating_add(bytes) <= f32_max_bytes() {
         idle.push(buf);
     }
 }
@@ -141,7 +147,7 @@ pub fn recycle(frame: Arc<VideoFrame>) {
     }
 }
 
-/// Free the idle float images. A standalone export leaves that shelf full (up to [`F32_MAX_BYTES`]
+/// Free the idle float images. A standalone export leaves that shelf full (up to `f32_max_bytes()`
 /// of images, each the size of that export's frames) and nothing else asks for those sizes again,
 /// so they would sit idle until the next export. Images still in use are not touched. The 8- and
 /// 16-bit plane shelves are left alone: playback recycles decoded frames through them all the time.
@@ -149,6 +155,15 @@ pub fn trim_f32() {
     // taken under the lock, freed after it: giving back hundreds of megabytes takes a moment
     let floats = std::mem::take(&mut *F32.lock().unwrap_or_else(PoisonError::into_inner));
     drop(floats);
+}
+
+/// Free every idle buffer (the machine is short of memory, or the work that filled the shelves is
+/// over). Buffers in use are not touched.
+pub fn trim_all() {
+    let floats = std::mem::take(&mut *F32.lock().unwrap_or_else(PoisonError::into_inner));
+    let a = std::mem::replace(&mut *U8.lock().unwrap_or_else(PoisonError::into_inner), Shelf::new());
+    let b = std::mem::replace(&mut *U16.lock().unwrap_or_else(PoisonError::into_inner), Shelf::new());
+    drop((floats, a, b));
 }
 
 /// Idle buffers held and buffers handed out again so far (`perf.stats`).
@@ -174,7 +189,9 @@ mod tests {
     use crate::Chroma;
 
     /// The plane shelves may hold up to this much alongside the float shelf in a test binary.
-    const U8_BYTES_UPPER_BOUND: usize = 2 * MAX_BYTES;
+    fn plane_bytes_upper_bound() -> usize {
+        2 * max_bytes()
+    }
 
     #[test]
     fn shelf_hands_back_a_fitting_buffer_and_stays_within_its_budget() {
@@ -216,9 +233,9 @@ mod tests {
         assert_ne!(other.as_ptr() as usize, at);
         // small buffers are not kept, and nothing exceeds the budget
         recycle_f32(vec![0.0; 100]);
-        let budget_len = F32_MAX_BYTES / 4;
+        let budget_len = f32_max_bytes() / 4;
         recycle_f32(vec![0.0; budget_len + 1]);
-        assert!(stats().idle_bytes <= F32_MAX_BYTES + (U8_BYTES_UPPER_BOUND), "idle {}", stats().idle_bytes);
+        assert!(stats().idle_bytes <= f32_max_bytes() + plane_bytes_upper_bound(), "idle {}", stats().idle_bytes);
         // leave nothing behind for other tests
         drop(take_f32_overwritten(len));
     }

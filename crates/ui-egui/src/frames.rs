@@ -93,6 +93,10 @@ struct Job {
     scale: f32,
     project: Arc<Project>,
     prio: u32,
+    /// Asked for by playback: source pictures may be prepared at reduced resolution
+    /// (`filmcraft_media::cancel::with_reduced_resolution`); a paused request for the same frame
+    /// renders it again in full.
+    reduced: bool,
 }
 
 struct Shared {
@@ -112,6 +116,9 @@ struct Shared {
     workers: usize,
     /// Always-on counters for `perf.stats`.
     stats: Mutex<FrameStats>,
+    /// Set when the [`FrameServer`] is dropped (a project was opened: the app made a new one):
+    /// its workers finish their job and exit, so its caches and media pool are freed.
+    shutdown: AtomicBool,
 }
 
 /// Cumulative frame-job statistics (`perf.stats`): cheap enough to keep on all the time.
@@ -272,6 +279,8 @@ impl filmcraft_render::SourceProvider for JobProvider {
 pub struct GpuPlan {
     pub plan: filmcraft_render::plan::FramePlan,
     pub prepared: filmcraft_gpu::PreparedPlan,
+    /// Prepared for playback from reduced-resolution source pictures ([`Job::reduced`]).
+    pub reduced: bool,
 }
 
 impl GpuPlan {
@@ -292,7 +301,11 @@ struct PlanCache {
 
 impl PlanCache {
     const MAX: usize = 96;
-    const BUDGET: usize = 1 << 30;
+
+    /// Bytes of plans kept: the memory governor's share (`filmcraft_frame::memory`), at most 1 GB.
+    fn budget() -> usize {
+        filmcraft_frame::memory::Budget::PLANS.bytes()
+    }
 
     fn get(&mut self, k: &FrameKey) -> Option<Arc<GpuPlan>> {
         self.clock += 1;
@@ -304,17 +317,22 @@ impl PlanCache {
     }
 
     fn insert(&mut self, k: FrameKey, p: GpuPlan) {
+        // a playback plan finishing late never replaces the full one rendered meanwhile
+        if p.reduced && self.map.get(&k).is_some_and(|(old, _, _)| !old.reduced) {
+            return;
+        }
         self.clock += 1;
         let b = p.bytes();
         self.bytes += b;
         if let Some((_, _, old)) = self.map.insert(k, (Arc::new(p), self.clock, b)) {
             self.bytes -= old;
         }
-        if self.map.len() > Self::MAX || self.bytes > Self::BUDGET {
+        let budget = Self::budget();
+        if self.map.len() > Self::MAX || self.bytes > budget {
             let mut v: Vec<(u64, FrameKey, usize)> = self.map.iter().map(|(k, v)| (v.1, *k, v.2)).collect();
             v.sort_unstable_by_key(|x| x.0);
             for (_, k, b) in v {
-                if self.map.len() <= Self::MAX && self.bytes <= Self::BUDGET {
+                if self.map.len() <= Self::MAX && self.bytes <= budget {
                     break;
                 }
                 self.map.remove(&k);
@@ -338,11 +356,13 @@ impl Cache {
         if let Some((old, _)) = self.map.insert(k, (v, self.clock)) {
             self.bytes -= old.px.len();
         }
-        if self.bytes > self.budget {
+        // Settings ▸ Memory, within the memory governor's share
+        let budget = self.budget.min(filmcraft_frame::memory::Budget::DISPLAY.bytes());
+        if self.bytes > budget {
             let mut all: Vec<(u64, FrameKey, usize)> = self.map.iter().map(|(k, (v, s))| (*s, *k, v.px.len())).collect();
             all.sort_unstable_by_key(|x| x.0);
             for (_, k, b) in all {
-                if self.bytes <= self.budget * 8 / 10 {
+                if self.bytes <= budget * 8 / 10 {
                     break;
                 }
                 self.map.remove(&k);
@@ -358,6 +378,26 @@ pub struct FrameServer {
     pub services: Arc<dyn Services>,
     pub previews: Arc<PreviewStore>,
     repaint: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
+}
+
+/// Once a second (called every UI pass): while the machine is short of memory
+/// (`filmcraft_frame::memory::under_pressure`), give the idle recycled buffers back. The caches
+/// already halve their budgets then; this frees what they hold idle.
+pub fn memory_housekeeping() {
+    static LAST: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(1)) {
+        return;
+    }
+    let pressure = filmcraft_frame::memory::under_pressure();
+    if pressure {
+        filmcraft_frame::pool::trim_all();
+        if !last.is_some_and(|(_, was)| was) {
+            let m = filmcraft_frame::memory::memory_status();
+            log::warn!("memory is short ({} MB available of {} MB): caches shrink", m.available.unwrap_or(0) >> 20, m.total.unwrap_or(0) >> 20);
+        }
+    }
+    *last = Some((Instant::now(), pressure));
 }
 
 /// Frames queued ahead of the playhead while playing (and how far ahead a queued job may be
@@ -391,6 +431,22 @@ pub fn playback_plan(render_cost: f64, fps: f64, workers: usize) -> (i64, i64) {
     (frames_per_job.ceil() as i64, load.ceil() as i64)
 }
 
+impl Drop for FrameServer {
+    /// Stop the workers (they hold the caches and the media pool): without this every project
+    /// opened left the previous server's threads waiting for work forever, with up to ~1.8 GB of
+    /// frames and plans and every source of the previous project.
+    fn drop(&mut self) {
+        self.shared.shutdown.store(true, Ordering::Relaxed);
+        self.shared.queue.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        for (_, c, _) in self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            c.store(true, Ordering::Relaxed);
+        }
+        *self.shared.done.lock().unwrap_or_else(|e| e.into_inner()) = Cache { map: HashMap::new(), bytes: 0, budget: 16 << 20, clock: 0 };
+        *self.shared.plans.lock().unwrap_or_else(|e| e.into_inner()) = PlanCache::default();
+        self.shared.cv.notify_all();
+    }
+}
+
 impl FrameServer {
     /// Settings ▸ Memory ▸ frame cache budget (bytes); evicts down to it right away.
     pub fn set_cache_budget(&self, bytes: usize) {
@@ -422,6 +478,7 @@ impl FrameServer {
             render_cost: Mutex::new(0.0),
             workers: workers.max(1),
             stats: Mutex::new(FrameStats::default()),
+            shutdown: AtomicBool::new(false),
         });
         let repaint: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = Arc::new(Mutex::new(None));
         #[cfg(not(target_arch = "wasm32"))]
@@ -518,18 +575,22 @@ impl FrameServer {
     /// non-reference pictures, while nearby frames stay decoded (and cached) for scrubbing back.
     pub fn request(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, prio: u32) {
         let late = (prio == 0).then(|| Tick::from_seconds_f64(SCRUB_KEEP_S));
-        self.request_job(key, time, scale, project, prio, false, late);
+        self.request_job(key, time, scale, project, prio, false, late, false);
     }
 
-    fn request_job(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, prio: u32, prefetch: bool, catch_up: Option<Tick>) {
+    #[allow(clippy::too_many_arguments)]
+    fn request_job(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, prio: u32, prefetch: bool, catch_up: Option<Tick>, reduced: bool) {
         let hit = || self.shared.stats.lock().unwrap_or_else(|e| e.into_inner()).request_hits += 1;
-        if self.shared.done.lock().unwrap_or_else(|e| e.into_inner()).map.contains_key(&key)
-            || self.shared.plans.lock().unwrap_or_else(|e| e.into_inner()).map.contains_key(&key)
-        {
+        // a plan prepared for playback (reduced) serves a paused request only until it is
+        // rendered again in full
+        let cached_plan = self.shared.plans.lock().unwrap_or_else(|e| e.into_inner()).map.get(&key).map(|(p, _, _)| p.reduced);
+        if self.shared.done.lock().unwrap_or_else(|e| e.into_inner()).map.contains_key(&key) || cached_plan.is_some_and(|r| reduced || !r) {
             hit();
             return;
         }
-        if self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(k, c, _)| *k == key && !c.load(Ordering::Relaxed)) {
+        if cached_plan.is_none()
+            && self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(k, c, _)| *k == key && !c.load(Ordering::Relaxed))
+        {
             hit();
             return;
         }
@@ -537,6 +598,7 @@ impl FrameServer {
         if let Some(j) = q.iter_mut().find(|j| j.key == key) {
             j.prio = j.prio.min(prio);
             j.prefetch &= prefetch;
+            j.reduced &= reduced;
             // the playhead only moves on: the newest (smallest) margin
             j.catch_up = match (j.catch_up, catch_up) {
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -564,7 +626,7 @@ impl FrameServer {
                 }
             }
         }
-        q.push_back(Job { key, queued: Instant::now(), cancel: Default::default(), prefetch, catch_up, time, scale, project: project.clone(), prio });
+        q.push_back(Job { key, queued: Instant::now(), cancel: Default::default(), prefetch, catch_up, time, scale, project: project.clone(), prio, reduced });
         drop(q);
         self.shared.cv.notify_one();
     }
@@ -583,7 +645,7 @@ impl FrameServer {
         let (lead, stride) = if preroll { (1, 1) } else { playback_plan(self.render_cost(), fps, self.shared.workers) };
         if lead <= 1 {
             // the frame due now; once the clock runs, the frames before it are late
-            self.request_job(key, rate.tick_of(key.frame), scale, project, 0, false, (!preroll && dir > 0).then_some(Tick::ZERO));
+            self.request_job(key, rate.tick_of(key.frame), scale, project, 0, false, (!preroll && dir > 0).then_some(Tick::ZERO), true);
         }
         // During preroll the clock has not started: only the frames that gate start, not a
         // prefetch run that walks the rest of a LongGOP and evicts the playhead pictures.
@@ -593,7 +655,7 @@ impl FrameServer {
             if f >= 0 {
                 // forward play: frames before the playhead are late (reverse play skips nothing)
                 let late = (!preroll && dir > 0).then(|| rate.tick_of(f) - rate.tick_of(key.frame));
-                self.request_job(FrameKey { frame: f, ..key }, rate.tick_of(f), scale, project, i as u32 + 1, true, late);
+                self.request_job(FrameKey { frame: f, ..key }, rate.tick_of(f), scale, project, i as u32 + 1, true, late, true);
             }
         }
         let (target, rev, cur) = (key.target, key.revision, key.frame);
@@ -775,6 +837,9 @@ fn worker(
         let job = {
             let mut q = sh.queue.lock().unwrap_or_else(|e| e.into_inner());
             loop {
+                if sh.shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
                 if !q.is_empty() {
                     // highest priority (lowest number) first; FIFO among equals
                     let best = q.iter().enumerate().min_by_key(|(i, j)| (j.prio, *i)).map(|(i, _)| i).unwrap_or(0);
@@ -829,12 +894,12 @@ fn run_job(sh: &Shared, job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Ser
             filmcraft_media::cancel::with_draft(job.key.draft, || {
                 filmcraft_media::cancel::with_background(is_background(job), || {
                     if let Target::SequencePlan(seq) = job.key.target {
-                        let (plan, pv) = plan_job(job, seq, pool, services, previews);
+                        let (plan, pv) = filmcraft_media::cancel::with_reduced_resolution(job.reduced, || plan_job(job, seq, pool, services, previews));
                         loading = filmcraft_media::pending::take();
                         if !job.cancel.load(Ordering::Relaxed) && !loading {
                             // Convert texels for upload here, not on the UI thread when the frame is shown.
                             let prepared = filmcraft_gpu::prepare(&plan);
-                            sh.plans.lock().unwrap_or_else(|e| e.into_inner()).insert(job.key, GpuPlan { plan, prepared });
+                            sh.plans.lock().unwrap_or_else(|e| e.into_inner()).insert(job.key, GpuPlan { plan, prepared, reduced: job.reduced });
                         }
                         pv
                     } else {
@@ -951,7 +1016,10 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
                 o.composite_onto(&mut img.px, w, h);
             }
         }
-        return (Rgba { w: img.w, h: img.h, px: img.over_black_rgba8() }, true);
+        let rgba = Rgba { w: img.w, h: img.h, px: img.over_black_rgba8() };
+        // the float image (33 MB at 1080p) serves the next frame instead of a fresh allocation
+        filmcraft_frame::pool::recycle_f32(img.px);
+        return (rgba, true);
     }
     let provider = provider(job, pool, services);
     let opts = filmcraft_render::RenderOptions { scale: job.scale, captions: true, ..Default::default() };
@@ -967,7 +1035,11 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
         }
     };
     let rgba = match img {
-        Some(img) => Rgba { w: img.w, h: img.h, px: img.over_black_rgba8() },
+        Some(img) => {
+            let rgba = Rgba { w: img.w, h: img.h, px: img.over_black_rgba8() };
+            filmcraft_frame::pool::recycle_f32(img.px);
+            rgba
+        }
         None => Rgba { w: 1, h: 1, px: vec![0, 0, 0, 255] },
     };
     (rgba, false)
@@ -989,6 +1061,24 @@ mod tests {
         // the scopes ask for the program frame at 40 while playing: never background
         assert!(!background_work(40, Target::Sequence(ItemId(1))));
         assert!(!background_work(50, Target::SequencePlan(ItemId(1))));
+    }
+
+    /// Dropping a frame server (the app makes a new one when a project is opened) stops its
+    /// workers, which held its caches and media pool for good before.
+    #[test]
+    fn a_dropped_frame_server_lets_its_workers_go() {
+        let s = filmcraft_engine::Session::default();
+        let server = super::FrameServer::new(s.media.clone(), s.services.clone(), s.previews.clone(), 3);
+        let shared = std::sync::Arc::downgrade(&server.shared);
+        let pool = std::sync::Arc::downgrade(&server.pool);
+        drop(s);
+        drop(server);
+        let t0 = std::time::Instant::now();
+        while (shared.strong_count() > 0 || pool.strong_count() > 0) && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(shared.strong_count(), 0, "the workers still hold the server's state");
+        assert_eq!(pool.strong_count(), 0, "the workers still hold the media pool");
     }
 
     #[test]

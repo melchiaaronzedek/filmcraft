@@ -41,8 +41,9 @@ mod synth_tests;
 mod tables;
 mod transform;
 
-pub use decoder::{DecodeStats, Decoder};
+pub use decoder::{DecodeStats, Decoder, bytes_in_flight};
 pub use error::{Error, Result};
+pub use picture::set_plane_allocators;
 
 /// Colour description from the VUI (ITU-T H.273 code points).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -4,7 +4,6 @@
 //! (`media_time` = pre-skip), or applied from `dOps` when a file has no edit list; random access
 //! decodes [`crate::audio::OPUS_PRE_ROLL`] of preceding packets first (≥ the 80 ms `roll` distance).
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use filmcraft_color::ColorInfo;
@@ -23,9 +22,8 @@ const MAX_AAC_PROBE_UNIT: usize = 8 * 6144 / 8;
 
 struct AudioState {
     decoder: Option<PacketDecoder>,
-    /// Decoded packets by sample index.
-    packets: HashMap<usize, Arc<Vec<Vec<f32>>>>,
-    order: Vec<usize>,
+    /// Decoded packets by sample index, within [`crate::audio::PacketCache`]'s bounds.
+    packets: crate::audio::PacketCache,
     last_decoded: Option<usize>,
 }
 
@@ -343,7 +341,7 @@ impl Mp4Source {
                     }
                     _ => (t.edit_offset, 0),
                 };
-                let state = Mutex::new(AudioState { decoder: None, packets: HashMap::new(), order: Vec::new(), last_decoded: None });
+                let state = Mutex::new(AudioState { decoder: None, packets: Default::default(), last_decoded: None });
                 Some(Mp4Audio { track: i, state, starts, offset, preroll })
             })
             .collect();
@@ -408,11 +406,6 @@ impl Mp4Source {
         };
         let p = Arc::new(decoded);
         st.packets.insert(i, p.clone());
-        st.order.push(i);
-        if st.order.len() > 4096 {
-            let old = st.order.remove(0);
-            st.packets.remove(&old);
-        }
         Ok(p)
     }
 }

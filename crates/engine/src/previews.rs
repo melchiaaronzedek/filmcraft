@@ -535,8 +535,9 @@ impl PreviewStore {
             }
         }
         let path = self.dir()?.join(name);
-        let bytes = std::fs::read(&path).ok()?;
-        let src = pool.open_bytes(name, bytes.into()).ok()?;
+        // read in place (container index now, samples on demand): a preview is ProRes at the
+        // sequence size, ~60 MB a second at 4K, and up to six stay open
+        let src = pool.open_file(&path.to_string_lossy(), &crate::FsServices).ok()?;
         let mut g = self.sources.lock().unwrap_or_else(|e| e.into_inner());
         g.push((name.to_string(), src.clone()));
         if g.len() > 6 {

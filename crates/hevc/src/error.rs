@@ -15,6 +15,10 @@ pub enum Error {
     /// A slice referenced a parameter set that has not been received.
     #[error("missing parameter set: {0}")]
     MissingParameterSet(String),
+    /// Decoding of a picture stopped because its decoder was reset or dropped (never returned
+    /// by [`crate::Decoder::decode`]: only internal to the picture jobs).
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

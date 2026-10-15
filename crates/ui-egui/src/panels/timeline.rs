@@ -914,7 +914,10 @@ fn draw_clip(
                         Some((inner.item, inner.source_time_at(mt)))
                     })
                     .unwrap_or((it.item, mt));
-                if let Some((tex, _)) = app.thumbnail(ctx, thumb_item, mt, 160) {
+                // while playing only what is ready: the tiles scrolling into view are asked for
+                // once playback stops instead of decoding beside it
+                let thumb = if app.playback.playing { app.thumbnail_if_ready(ctx, thumb_item, mt, 160) } else { app.thumbnail(ctx, thumb_item, mt, 160) };
+                if let Some((tex, _)) = thumb {
                     let r = Rect::from_min_size(pos2(x, th.min.y), vec2(w, th.height()));
                     cp.image(tex, r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 }

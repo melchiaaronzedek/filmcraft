@@ -259,6 +259,10 @@ const SCREENSHOT_TIMEOUT_S: f64 = 10.0;
 /// timeline zoom animation finished) before capturing what is there.
 const SCREENSHOT_SETTLE_MAX_S: f64 = 5.0;
 
+/// Thumbnail textures kept at most (each 57-230 KB of GPU memory, which on an integrated GPU is
+/// system RAM): enough for a timeline full of filmstrips and the Project panel's icons.
+const MAX_THUMB_TEXTURES: usize = 400;
+
 /// Export entries that run from the menus through the save panel: command, filter label,
 /// extension.
 pub(crate) const EXPORT_SAVE_DIALOGS: [(&str, &str, &str); 7] = [
@@ -289,6 +293,10 @@ pub struct FilmcraftApp {
     pub auto: automation::Registry,
     /// Named textures (monitors, thumbnails) with the key they show.
     textures: HashMap<String, (FrameKey, TextureHandle)>,
+    /// Thumbnail textures (named per frame: `thumb-…`, `mbthumb-…`) in the order they were made:
+    /// the oldest are freed beyond [`MAX_THUMB_TEXTURES`] (hover scrubbing made one per frame
+    /// passed over, kept for the whole session).
+    thumb_textures: std::collections::VecDeque<String>,
     control_rx: Option<Receiver<ControlRequest>>,
     /// One explicit panel reveal; consumed by the custom renderer, never repeated per frame.
     pub(crate) pending_panel_raise: Option<PanelKind>,
@@ -553,6 +561,7 @@ impl FilmcraftApp {
             native_dialog: None,
             auto: Default::default(),
             textures: HashMap::new(),
+            thumb_textures: std::collections::VecDeque::new(),
             control_rx: None,
             pending_panel_raise: None,
             control_input_only: false,
@@ -633,6 +642,7 @@ impl FilmcraftApp {
                 FrameServer::default_workers(),
             ));
             self.textures.clear();
+            self.thumb_textures.clear();
             self.tl.reset_media_caches();
             // the new frame server needs the Memory settings
             self.applied_prefs = None;
@@ -729,6 +739,8 @@ impl FilmcraftApp {
             i18n::set_current(self.ui.language);
         }
         self.frames.set_cache_budget(p.memory.frame_cache_mb as usize * (1 << 20));
+        // every cache and decoder sizes itself from what this leaves (`filmcraft_frame::memory`)
+        filmcraft_frame::memory::set_reserved_bytes(u64::from(p.memory.ram_reserved_gb) << 30);
         self.ui.play_after_render = p.timeline.play_after_rendering;
         let hardware_changed = prev.as_ref().is_none_or(|q| q.audio_hardware != p.audio_hardware);
         let pitch_changed = prev.as_ref().is_some_and(|q| q.audio.maintain_pitch_shuttling != p.audio.maintain_pitch_shuttling);
@@ -1173,7 +1185,22 @@ impl FilmcraftApp {
         let tex = ctx.load_texture(name, egui::ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.px), TextureOptions::LINEAR);
         let id = tex.id();
         self.textures.insert(name.to_string(), (key, tex));
+        self.note_thumbnail_texture(name);
         id
+    }
+
+    /// Keep at most [`MAX_THUMB_TEXTURES`] thumbnail textures, freeing the oldest (one still on
+    /// screen is uploaded again from the frame cache on its next pass).
+    fn note_thumbnail_texture(&mut self, name: &str) {
+        if !(name.starts_with("thumb-") || name.starts_with("mbthumb-")) {
+            return;
+        }
+        self.thumb_textures.push_back(name.to_string());
+        while self.thumb_textures.len() > MAX_THUMB_TEXTURES {
+            if let Some(old) = self.thumb_textures.pop_front() {
+                self.textures.remove(&old);
+            }
+        }
     }
 
     /// Like [`Self::texture_for`], uploading `map(img)` (computed only when the key changed).
@@ -1197,6 +1224,7 @@ impl FilmcraftApp {
         let tex = ctx.load_texture(name, egui::ColorImage::from_rgba_unmultiplied([m.w, m.h], &m.px), TextureOptions::LINEAR);
         let id = tex.id();
         self.textures.insert(name.to_string(), (key, tex));
+        self.note_thumbnail_texture(name);
         id
     }
 
@@ -1238,6 +1266,23 @@ impl FilmcraftApp {
     }
 
     pub fn thumbnail(&mut self, ctx: &egui::Context, item: filmcraft_project::ItemId, t: Tick, width: u32) -> Option<(egui::TextureId, egui::Vec2)> {
+        self.thumbnail_requested(ctx, item, t, width, true)
+    }
+
+    /// [`Self::thumbnail`] if it is ready, without asking for it otherwise (the timeline while
+    /// playing: tiles scrolling into view would each start a decode beside playback).
+    pub fn thumbnail_if_ready(&mut self, ctx: &egui::Context, item: filmcraft_project::ItemId, t: Tick, width: u32) -> Option<(egui::TextureId, egui::Vec2)> {
+        self.thumbnail_requested(ctx, item, t, width, false)
+    }
+
+    fn thumbnail_requested(
+        &mut self,
+        ctx: &egui::Context,
+        item: filmcraft_project::ItemId,
+        t: Tick,
+        width: u32,
+        request: bool,
+    ) -> Option<(egui::TextureId, egui::Vec2)> {
         let pi = self.session.project.item(item)?;
         let src_w = match &pi.kind {
             filmcraft_project::ItemKind::Media(m) => m.info.video.as_ref()?.width,
@@ -1253,9 +1298,11 @@ impl FilmcraftApp {
             let id = self.texture_for(ctx, &name, key, &img);
             return Some((id, egui::vec2(img.w as f32, img.h as f32)));
         }
-        let scale = width as f32 / src_w.max(1) as f32;
-        let project = self.session.project.clone();
-        self.frames.request(key, rate.tick_of(frame), scale, &project, 50);
+        if request {
+            let scale = width as f32 / src_w.max(1) as f32;
+            let project = self.session.project.clone();
+            self.frames.request(key, rate.tick_of(frame), scale, &project, 50);
+        }
         self.texture_existing(&name)
     }
 
@@ -2041,6 +2088,7 @@ impl eframe::App for FilmcraftApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // a native file dialog's answer first, so the panels draw what it chose (#260)
         self.poll_native_dialog(ctx);
+        crate::frames::memory_housekeeping();
         if !self.styled {
             theme::install(ctx, &self.tokens);
             // theme::install replaces the fonts: add the system Japanese font back (or fall back to

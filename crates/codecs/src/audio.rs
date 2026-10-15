@@ -1355,3 +1355,76 @@ mod gapless_tests {
         assert_eq!(src.samples[0].len(), AUDIO_FRAMES * 1152 - (576 + 529));
     }
 }
+
+/// Decoded audio packets kept for re-reads (playback reads overlapping windows; the timeline's
+/// waveforms walk whole files), oldest out first: at most [`PacketCache::MAX_PACKETS`] and
+/// [`PacketCache::MAX_BYTES`]. Counting packets alone was not a bound: camera PCM in QuickTime
+/// stores a whole chunk per sample, so 4096 packets could be gigabytes of samples.
+#[derive(Default)]
+pub(crate) struct PacketCache {
+    packets: std::collections::HashMap<usize, std::sync::Arc<Vec<Vec<f32>>>>,
+    order: std::collections::VecDeque<usize>,
+    bytes: usize,
+}
+
+impl PacketCache {
+    pub const MAX_PACKETS: usize = 4096;
+    pub const MAX_BYTES: usize = 16 << 20;
+
+    fn size(p: &[Vec<f32>]) -> usize {
+        p.iter().map(|c| c.len().saturating_mul(4)).sum()
+    }
+
+    pub fn get(&self, i: &usize) -> Option<&std::sync::Arc<Vec<Vec<f32>>>> {
+        self.packets.get(i)
+    }
+
+    pub fn insert(&mut self, i: usize, p: std::sync::Arc<Vec<Vec<f32>>>) {
+        self.bytes = self.bytes.saturating_add(Self::size(&p));
+        if let Some(old) = self.packets.insert(i, p) {
+            self.bytes = self.bytes.saturating_sub(Self::size(&old));
+        } else {
+            self.order.push_back(i);
+        }
+        // (the newest packet stays, however large)
+        while (self.order.len() > Self::MAX_PACKETS || self.bytes > Self::MAX_BYTES) && self.order.len() > 1 {
+            let Some(old) = self.order.pop_front() else { break };
+            if let Some(p) = self.packets.remove(&old) {
+                self.bytes = self.bytes.saturating_sub(Self::size(&p));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod packet_cache_tests {
+    use super::PacketCache;
+    use std::sync::Arc;
+
+    #[test]
+    fn bounded_by_bytes_and_count_oldest_out_first() {
+        let mut c = PacketCache::default();
+        // 1 MiB stereo packets: sixteen fit
+        let pkt = || Arc::new(vec![vec![0.0f32; 1 << 17]; 2]);
+        for i in 0..40 {
+            c.insert(i, pkt());
+        }
+        assert!(c.bytes <= PacketCache::MAX_BYTES, "{} bytes", c.bytes);
+        assert_eq!(c.packets.len(), 16);
+        assert!(c.get(&39).is_some() && c.get(&24).is_some() && c.get(&23).is_none());
+        // re-inserting a packet counts its bytes once
+        c.insert(39, pkt());
+        assert_eq!(c.packets.len(), 16);
+        assert_eq!(c.order.len(), 16);
+        // small packets: the count bounds them
+        let mut c = PacketCache::default();
+        for i in 0..PacketCache::MAX_PACKETS + 10 {
+            c.insert(i, Arc::new(vec![vec![0.0; 4]]));
+        }
+        assert_eq!(c.packets.len(), PacketCache::MAX_PACKETS);
+        // a packet larger than the budget still stays (the one just decoded)
+        let mut c = PacketCache::default();
+        c.insert(0, Arc::new(vec![vec![0.0f32; PacketCache::MAX_BYTES]]));
+        assert!(c.get(&0).is_some());
+    }
+}
