@@ -3592,3 +3592,13 @@
 	Open a sequence to search its graphics	打开序列以搜索其中的图形
 	No text graphics in this sequence. Add text with the Type tool.	此序列中没有文本图形。请用文字工具添加文本。
 	No matching text.	没有匹配的文本。
+	Buffering…	正在缓冲…
+	Click to dismiss	单击关闭
+	Click to reset	单击重置
+	Create Proxies ({n})	创建代理 ({n})
+	Don't show again this session	本次会话不再显示
+	Dropped frames:	丢帧：
+	Pixel Format	像素格式
+	Playback is dropping frames: this footage is decoded on the CPU.	播放正在丢帧：此素材由 CPU 解码。
+	Proxies play it smoothly; exports still use the original media.	使用代理可流畅播放；导出仍使用原始媒体。
+	Rendering…	正在渲染…

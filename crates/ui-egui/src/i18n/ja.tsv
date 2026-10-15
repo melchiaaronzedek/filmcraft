@@ -3616,3 +3616,13 @@
 	Open a sequence to search its graphics	シーケンスを開くとグラフィックスを検索できます
 	No text graphics in this sequence. Add text with the Type tool.	このシーケンスにはテキストのグラフィックスがありません。文字ツールでテキストを追加してください。
 	No matching text.	一致するテキストはありません。
+	Buffering…	バッファリング中…
+	Click to dismiss	クリックして閉じる
+	Click to reset	クリックしてリセット
+	Create Proxies ({n})	プロキシを作成 ({n})
+	Don't show again this session	このセッションでは表示しない
+	Dropped frames:	ドロップフレーム:
+	Pixel Format	ピクセル形式
+	Playback is dropping frames: this footage is decoded on the CPU.	再生中にフレームがドロップしています：この素材は CPU でデコードされています。
+	Proxies play it smoothly; exports still use the original media.	プロキシならスムーズに再生できます。書き出しには元のメディアが使われます。
+	Rendering…	レンダリング中…

@@ -241,6 +241,29 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
         if let Some(tex) = shown {
             ui.painter().image(tex, pic, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         }
+        // Waiting for the frame asked for (a seek decoding from its keyframe, 4K software decoding
+        // catching up, the clock waiting for its first frames): say so after a moment instead of
+        // leaving a stand-in frame that looks like a hang.
+        let preroll = which == Which::Program && app.playback.preroll.is_some();
+        let waiting_since = egui::Id::new((prefix, "waiting-since"));
+        let now = ui.input(|i| i.time);
+        if (!exact && !playing) || preroll {
+            let since = ui.ctx().data_mut(|d| *d.get_temp_mut_or(waiting_since, now));
+            if now - since > 0.2 {
+                let label = if preroll { tl!("Buffering…") } else { tl!("Rendering…") };
+                let galley = ui.painter().layout_no_wrap(label.to_string(), Tokens::ui(10.5), Color32::WHITE);
+                let r = Rect::from_min_size(pos2(pic.max.x - galley.size().x - 26.0, pic.min.y + 8.0), galley.size() + vec2(18.0, 6.0));
+                ui.painter().rect_filled(r, r.height() / 2.0, Color32::from_black_alpha(150));
+                // a small spinner dot that circles
+                let a = (now * 6.0) as f32;
+                ui.painter().circle_filled(pos2(r.min.x + 8.0 + a.cos() * 2.5, r.center().y + a.sin() * 2.5), 2.0, t.accent);
+                ui.painter().galley(pos2(r.min.x + 14.0, r.min.y + 3.0), galley, Color32::WHITE);
+                app.auto.add(&format!("{prefix}.waiting"), r, label);
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
+        } else {
+            ui.ctx().data_mut(|d| d.remove::<f64>(waiting_since));
+        }
         if let Some(ra) = ref_area {
             // the reference frame (CPU path)
             let rf = rate.frame_at(Tick(mv.compare_ref.unwrap_or(time.0)));
@@ -278,10 +301,37 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
             ui.painter().text(pos2(video_area.max.x - 8.0, video_area.min.y + 6.0), Align2::RIGHT_TOP, label, Tokens::ui(10.0), t.text_dim);
         }
     }
-    // Dropped-frame indicator (Program only)
-    if which == Which::Program && app.playback.playing {
-        let c = if app.playback.meter.counts().1 > 0 { t.render_yellow } else { t.render_green };
-        ui.painter().circle_filled(pos2(video_area.min.x + 10.0, video_area.min.y + 10.0), 4.0, c);
+    // Dropped-frame indicator (Program only): while playing and after it stops, with the count
+    // (green: none dropped, yellow: some); hover for the details, click to reset.
+    let (shown_n, dropped_n) = app.playback.meter.counts();
+    if which == Which::Program && show_picture && (app.playback.playing || shown_n + dropped_n > 0) {
+        let c = if dropped_n > 0 { t.render_yellow } else { t.render_green };
+        let label = if dropped_n > 0 { format!("{dropped_n}") } else { String::new() };
+        let galley = ui.painter().layout_no_wrap(label, Tokens::ui(10.0), Color32::WHITE);
+        let w = if galley.size().x > 0.0 { galley.size().x + 22.0 } else { 14.0 };
+        let r = Rect::from_min_size(pos2(video_area.min.x + 4.0, video_area.min.y + 4.0), vec2(w, 14.0));
+        if galley.size().x > 0.0 {
+            ui.painter().rect_filled(r, 7.0, Color32::from_black_alpha(140));
+            ui.painter().galley(pos2(r.min.x + 15.0, r.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
+        }
+        ui.painter().circle_filled(pos2(r.min.x + 7.0, r.center().y), 4.0, c);
+        let total = shown_n + dropped_n;
+        let pct = if total > 0 { dropped_n as f64 * 100.0 / total as f64 } else { 0.0 };
+        // (above the picture's own click / drag handling, which is registered later in the pass)
+        let resp = egui::Area::new(egui::Id::new((prefix, "dropped-frames-hit")))
+            .order(egui::Order::Foreground)
+            .fixed_pos(r.min)
+            .show(ui.ctx(), |ui| ui.allocate_rect(egui::Rect::from_min_size(ui.min_rect().min, r.size()), Sense::click()))
+            .inner;
+        let detail = format!("{} {dropped_n} / {total} ({pct:.1} %)", tl!("Dropped frames:"));
+        app.auto.add("program.droppedFrames", r, &detail);
+        let resp = resp.on_hover_text(format!("{detail}\n{}", tl!("Click to reset")));
+        if resp.clicked() {
+            app.playback.meter = Default::default();
+        }
+    }
+    if which == Which::Program && show_picture {
+        heavy_media_advice(app, ui, video_area, &t);
     }
     // A click on the Program monitor around the picture lets go of what is selected on it (#683;
     // in the picture the overlays do that). Under the picture and the overlays, so they come first.
@@ -460,6 +510,92 @@ const ASKED_KEYS: usize = 64;
 /// is, and showing it keeps the picture one pass behind the mouse instead of frozen until the
 /// mouse rests. Playback has its own schedule and remembers nothing (what was on screen before
 /// Play is no stand-in for where it stopped).
+/// Whether a clip's video is heavy to decode on the CPU: 4K or larger, or 10-bit or 4:2:2
+/// (consumer GPUs decode neither in hardware, so it plays from the software decoders).
+fn heavy_video(v: &filmcraft_media::VideoStreamInfo) -> bool {
+    let f = v.pixel_format.as_str();
+    u64::from(v.width) * u64::from(v.height) >= 3840 * 2000 || f.contains("4:2:2") || f.contains("4:4:4") || f.contains("10-bit") || f.contains("12-bit")
+}
+
+/// The clips of the active sequence (as project items) whose media is heavy and has no proxy.
+fn heavy_unproxied_clips(app: &FilmcraftApp) -> Vec<u64> {
+    let Some(seq) = app.session.active_sequence() else { return Vec::new() };
+    let mut out = Vec::new();
+    for it in seq.video_tracks.iter().flat_map(|tr| tr.items.iter()) {
+        if let Some(ItemKind::Media(m)) = app.session.project.item(it.item).map(|i| &i.kind)
+            && m.proxy.is_none()
+            && m.info.video.as_ref().is_some_and(heavy_video)
+            && !out.contains(&it.item.0)
+        {
+            out.push(it.item.0);
+        }
+    }
+    out
+}
+
+/// Playback dropped many frames on heavy media (4K / 10-bit / 4:2:2 camera clips the GPU cannot
+/// decode) without proxies: say why and offer to create them (Premiere users know the cure, others
+/// see only a stuttering monitor). Dismissed for the session with ×.
+fn heavy_media_advice(app: &mut FilmcraftApp, ui: &mut egui::Ui, area: Rect, t: &Tokens) {
+    if app.ui.heavy_media_advice_dismissed || app.ui.create_proxies.is_some() {
+        return;
+    }
+    let (shown, dropped) = app.playback.meter.counts();
+    let total = shown + dropped;
+    if total < 48 || dropped.saturating_mul(100) < total.saturating_mul(15) {
+        return;
+    }
+    let heavy = heavy_unproxied_clips(app);
+    if heavy.is_empty() {
+        return;
+    }
+    let w = (area.width() - 24.0).clamp(180.0, 600.0);
+    let r = Rect::from_min_size(pos2(area.center().x - w / 2.0, area.max.y - 70.0), vec2(w, 58.0));
+    if r.min.y < area.min.y + 30.0 {
+        return;
+    }
+    // above the picture's own click / drag handling (registered later in the pass)
+    let clip = ui.clip_rect();
+    egui::Area::new(egui::Id::new("program-heavy-media-advice")).order(egui::Order::Foreground).fixed_pos(r.min).interactable(true).show(ui.ctx(), |ui| {
+        ui.set_clip_rect(clip);
+        heavy_media_banner(app, ui, r, t, heavy);
+    });
+}
+
+fn heavy_media_banner(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, t: &Tokens, heavy: Vec<u64>) {
+    let w = r.width();
+    let p = ui.painter();
+    p.rect_filled(r, 8.0, Color32::from_black_alpha(200));
+    p.rect_stroke(r, 8.0, Stroke::new(1.0, t.render_yellow.gamma_multiply(0.7)), StrokeKind::Inside);
+    let text_w = w - 210.0;
+    let line1 =
+        p.layout(tl!("Playback is dropping frames: this footage is decoded on the CPU.").to_string(), Tokens::ui(11.5), Color32::WHITE, text_w.max(80.0));
+    let line2 = p.layout(
+        tl!("Proxies play it smoothly; exports still use the original media.").to_string(),
+        Tokens::ui(10.5),
+        Color32::from_gray(200),
+        text_w.max(80.0),
+    );
+    let y = r.min.y + 10.0;
+    let l2y = y + line1.size().y + 2.0;
+    p.galley(pos2(r.min.x + 14.0, y), line1, Color32::WHITE);
+    p.galley(pos2(r.min.x + 14.0, l2y), line2, Color32::from_gray(200));
+    let create = Rect::from_min_size(pos2(r.max.x - 192.0, r.center().y - 13.0), vec2(140.0, 26.0));
+    let close = Rect::from_min_size(pos2(r.max.x - 42.0, r.center().y - 13.0), vec2(26.0, 26.0));
+    let label = tlf!("Create Proxies ({n})", n = heavy.len());
+    let cresp = ui.put(create, egui::Button::new(egui::RichText::new(label.clone()).strong()).fill(t.accent).corner_radius(5.0));
+    app.auto.add("program.advice.createProxies", create, &label);
+    let xresp = ui.put(close, egui::Button::new("×").frame(false)).on_hover_text(tl!("Don't show again this session"));
+    app.auto.add("program.advice.dismiss", close, "Dismiss");
+    if cresp.clicked() {
+        app.ui.create_proxies =
+            Some(crate::state::ProxyDraft { items: heavy, preset: filmcraft_engine::proxies::DEFAULT_PROXY_PRESET.into(), destination: String::new() });
+    }
+    if xresp.clicked() {
+        app.ui.heavy_media_advice_dismissed = true;
+    }
+}
+
 fn asked_before(app: &mut FilmcraftApp, prefix: &str, key: FrameKey, playing: bool) -> Vec<FrameKey> {
     let asked = app.monitor_asked.entry(prefix.to_string()).or_default();
     if playing {
@@ -1041,11 +1177,29 @@ fn transport(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, which: Which)
     }
 }
 
+/// A transport tooltip with the command's current shortcut (the labels name Premiere's default
+/// keys, which a custom layout or another preset changes): the key in parentheses is replaced by
+/// the live binding, or dropped when the command has none.
+fn live_tip(app: &FilmcraftApp, label: &str, command: &str) -> String {
+    let base = match label.rfind(" (") {
+        Some(i) if label.ends_with(')') => &label[..i],
+        _ => label,
+    };
+    match app.session.shortcuts.primary(command) {
+        Some(k) => format!("{base} ({})", crate::menus::shortcut_text(&k)),
+        None => base.to_string(),
+    }
+}
+
 fn transport_button(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, prefix: &str, icon: Icon, command: &str, label: &str) -> bool {
     let t = app.tokens;
-    let response = ui.interact(rect, egui::Id::new((prefix, command)), Sense::click()).on_hover_text(label);
+    let tip = live_tip(app, label, command);
+    let response = ui.interact(rect, egui::Id::new((prefix, command)), Sense::click()).on_hover_text(tip);
     app.auto.add_response(&format!("{prefix}.transport.{command}"), &response, label);
-    if response.hovered() {
+    // pressed while the button is held (feedback at the click, not only at the release)
+    if response.is_pointer_button_down_on() {
+        ui.painter().rect_filled(rect, 4.0, t.pressed);
+    } else if response.hovered() {
         ui.painter().rect_filled(rect, 4.0, t.hover);
     }
     let size = if matches!(command, "playback.toggle" | "source.playback.toggle") { 20.0 } else { 18.0 };

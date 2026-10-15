@@ -1351,6 +1351,30 @@ fn build() -> Vec<CommandSpec> {
             // Settings ▸ Media ▸ Import image sequences on, a single numbered still is detected.
             let as_sequence = p.get("imageSequence").and_then(Value::as_bool).unwrap_or(false);
             let detect = !as_sequence && s.prefs.media.import_image_sequences && paths.len() == 1;
+            // A folder (a camera card's DCIM/100_FUJI dropped from the file manager, picked in the
+            // import dialog or named on the command line) imports as the Media Browser does: a bin
+            // named after it with its media, and a bin per sub-folder with media.
+            let (folders, paths): (Vec<String>, Vec<String>) =
+                paths.into_iter().partition(|path| !as_sequence && crate::media_browser::is_folder(&*s.services, path));
+            let mut folder_results = Vec::new();
+            for folder in folders {
+                let mut q = json!({"paths": [folder], "imageSequence": false});
+                if let Some(b) = bin {
+                    q["bin"] = json!(b.0);
+                }
+                match s.execute("mediaBrowser.import", q) {
+                    Ok(r) => folder_results.push(r),
+                    Err(e) => errors.push(e.to_string()),
+                }
+            }
+            // (their items went through Ingest and transcription in the nested import already)
+            let mut folder_ids: Vec<u64> = Vec::new();
+            let mut folder_bins: Vec<Value> = Vec::new();
+            for r in &folder_results {
+                folder_ids.extend(r["items"].as_array().into_iter().flatten().filter_map(Value::as_u64));
+                folder_bins.extend(r["bins"].as_array().into_iter().flatten().cloned());
+                errors.extend(r["errors"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
+            }
             for path in paths {
                 if as_sequence || (detect && detect_image_sequence(s, &path)) {
                     match import_image_sequence(s, &path, bin) {
@@ -1394,7 +1418,7 @@ fn build() -> Vec<CommandSpec> {
                     Err(e) => errors.push(format!("{path}: {e}")),
                 }
             }
-            if ids.is_empty() && sequences.is_empty() && reports.is_empty() && !errors.is_empty() {
+            if ids.is_empty() && folder_ids.is_empty() && sequences.is_empty() && reports.is_empty() && !errors.is_empty() {
                 return Err(EngineError::Other(errors.join("; ")));
             }
             // Project Settings ▸ Ingest: copy / transcode / create proxies
@@ -1431,6 +1455,12 @@ fn build() -> Vec<CommandSpec> {
             };
             if !image_sequences.is_empty() {
                 out["imageSequences"] = json!(image_sequences);
+            }
+            if !folder_results.is_empty() {
+                if let Some(items) = out["items"].as_array_mut() {
+                    items.extend(folder_ids.iter().map(|i| json!(i)));
+                }
+                out["bins"] = json!(folder_bins);
             }
             // Newly imported files may resolve paths the project already listed as offline
             // (issue #110): rebuild s.offline.missing so the "Media missing" badge clears, and drop

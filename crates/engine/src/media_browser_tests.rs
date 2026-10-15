@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use crate::media_browser::{self, DirEntry, Volume, VolumeKind};
 use crate::{Services, Session};
+use filmcraft_project::ItemId;
 
 /// An in-memory filesystem: directories and files (with bytes).
 #[derive(Default)]
@@ -250,6 +251,32 @@ fn importing_a_folder_mirrors_its_sub_folders_as_bins() {
     let day = sub(&shoot, "Day 1");
     assert_eq!(tree(&day), ["room.wav", "bin Cam A"]);
     assert_eq!(tree(&sub(&day, "Cam A")), ["take1.wav", "take2.wav"]);
+}
+
+/// `file.import` with a folder (dropped from the file manager, picked in the import dialog, given
+/// on the command line) imports it as the Media Browser does, a camera card's DCIM included:
+/// bins per folder with media, hidden files and non-media left out.
+#[test]
+fn file_import_of_a_folder_makes_bins_like_the_media_browser() {
+    let mut fs = FakeFs::new();
+    let wav = filmcraft_media::wav::write_wav16(&[0.0; 4800], 2, 48_000);
+    fs.dirs.extend(["/Card", "/Card/DCIM", "/Card/DCIM/100_FUJI", "/Card/MISC"].map(String::from));
+    for f in ["/Card/DCIM/100_FUJI/DSCF0001.wav", "/Card/DCIM/100_FUJI/DSCF0002.wav", "/Card/MISC/notes.txt", "/Card/DCIM/100_FUJI/.hidden.wav"] {
+        fs.files.get_mut().unwrap().insert(f.into(), wav.clone());
+    }
+    let mut s = Session::new(Arc::new(fs));
+    let r = s.execute("file.import", json!({"paths": ["/Card"]})).unwrap();
+    let names: Vec<String> = r["items"].as_array().unwrap().iter().map(|i| s.project.item(ItemId(i.as_u64().unwrap())).unwrap().name.clone()).collect();
+    assert_eq!(names, ["DSCF0001.wav", "DSCF0002.wav"], "{r}");
+    assert_eq!(r["bins"].as_array().unwrap().len(), 3, "Card ▸ DCIM ▸ 100_FUJI: {r}");
+    // a folder without media is an error, a file beside it still imports
+    let mut fs = FakeFs::new();
+    fs.dirs.push("/Empty".into());
+    fs.files.get_mut().unwrap().insert("/a.wav".into(), wav);
+    let mut s = Session::new(Arc::new(fs));
+    let r = s.execute("file.import", json!({"paths": ["/Empty", "/a.wav"]})).unwrap();
+    assert_eq!(r["items"].as_array().unwrap().len(), 1, "{r}");
+    assert!(r["errors"].as_array().unwrap().iter().any(|e| e.as_str().unwrap().contains("Empty")), "{r}");
 }
 
 #[test]

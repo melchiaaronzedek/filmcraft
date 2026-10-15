@@ -437,6 +437,11 @@ struct Folder {
 
 /// The files the browser shows in `dir` and its sub-folders, as a tree; `None` when the tree
 /// holds none (or `budget` folders were walked already).
+/// Whether `path` is a folder (not a file, nor a bundle the browser lists as a media item).
+pub(crate) fn is_folder(services: &dyn Services, path: &str) -> bool {
+    matches!(services.list_entries(path), Some(Ok(_))) && kind_of(path).is_none()
+}
+
 fn walk_folder(services: &dyn Services, dir: &str, depth: usize, budget: &mut usize) -> Option<Folder> {
     *budget = budget.checked_sub(1)?;
     let entries = list(services, dir, "all").ok()?;
@@ -512,7 +517,7 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     let mut empty = Vec::new();
     let mut budget = FOLDER_IMPORT_MAX_FOLDERS;
     for path in paths {
-        let is_dir = matches!(s.services.list_entries(&path), Some(Ok(_))) && kind_of(&path).is_none();
+        let is_dir = is_folder(&*s.services, &path);
         if !is_dir {
             files.push(path);
         } else if seq {

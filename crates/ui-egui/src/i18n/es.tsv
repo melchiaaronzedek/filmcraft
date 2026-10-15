@@ -3617,3 +3617,13 @@
 	Open a sequence to search its graphics	Abre una secuencia para buscar en sus gráficos
 	No text graphics in this sequence. Add text with the Type tool.	Esta secuencia no tiene gráficos con texto. Añade texto con la herramienta Texto.
 	No matching text.	Ningún texto coincide.
+	Buffering…	Almacenando en búfer…
+	Click to dismiss	Haz clic para cerrar
+	Click to reset	Haz clic para restablecer
+	Create Proxies ({n})	Crear proxies ({n})
+	Don't show again this session	No volver a mostrar en esta sesión
+	Dropped frames:	Fotogramas perdidos:
+	Pixel Format	Formato de píxel
+	Playback is dropping frames: this footage is decoded on the CPU.	La reproducción pierde fotogramas: este material se decodifica en la CPU.
+	Proxies play it smoothly; exports still use the original media.	Con proxies se reproduce con fluidez; las exportaciones siguen usando los medios originales.
+	Rendering…	Procesando…
