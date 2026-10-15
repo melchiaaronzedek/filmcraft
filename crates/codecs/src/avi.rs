@@ -514,8 +514,8 @@ impl MediaSource for AviSource {
         let s = self.vstream.ok_or(MediaError::NoStream("video"))?;
         let t = req.time.max(Tick::ZERO);
         let slot = |t: Tick| self.rate.frame_at(t);
-        let late = filmcraft_media::cancel::catch_up().map(|m| slot(t - m));
-        Ok(self.video.frame_late(&AviVideo { src: self, stream: s }, slot(t), late)?)
+        let late = || filmcraft_media::cancel::catch_up().map(|m| slot(t - m));
+        Ok(self.video.frame_late(&AviVideo { src: self, stream: s }, slot(t), &late)?)
     }
 
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer, MediaError> {

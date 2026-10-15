@@ -415,7 +415,8 @@ impl HevcDecoder {
 
     /// A decoder with `threads` workers whose pictures in flight stay within the memory governor's
     /// decoder budget (`filmcraft_frame::memory`): at 4K 10-bit 4:2:2 the default `threads + 2`
-    /// pictures of a 16-thread decoder took ~1.8 GB, and six (~0.5 GB) decode as fast.
+    /// pictures of a 16-thread decoder took ~1.8 GB; about ten (~0.85 GB on a 16 GB machine) keep
+    /// a laptop's decoding just above real time while it also plays back (six fell short).
     fn make_inner(hvcc: &[u8], threads: usize) -> Result<filmcraft_hevc::Decoder> {
         filmcraft_hevc::set_plane_allocators(filmcraft_frame::pool::take_u8, filmcraft_frame::pool::take_u16);
         let mut dec = filmcraft_hevc::Decoder::with_threads(threads);

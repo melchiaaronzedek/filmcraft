@@ -88,6 +88,8 @@ struct Job {
     /// zero for the frame due now), so a decoder catching up may skip pictures only late frames
     /// need (`filmcraft_media::cancel::with_catch_up`).
     catch_up: Option<Tick>,
+    /// When `catch_up` was measured (it shrinks from then on, as the playhead moves).
+    catch_up_at: Instant,
     time: Tick,
     /// Output scale relative to the target's frame size.
     scale: f32,
@@ -416,6 +418,13 @@ pub const PREROLL_FRAMES: i64 = 6;
 pub const SCRUB_KEEP_S: f64 = 2.0;
 pub const PREROLL_TIMEOUT_S: f64 = 0.5;
 
+/// While playing, a monitor whose due frame is not ready shows the nearest finished frame up to
+/// this many frames behind it ([`FrameServer::nearest_plan`], [`FrameServer::nearest`]). Jobs for
+/// frames the playhead passed less than this long ago go on: when decoding runs a little behind
+/// real time, their frames are what the monitor shows (late but moving); cancelling them as soon
+/// as they were due left 4K LongGOP playback showing a handful of distinct frames per second.
+pub const LATE_HOLD_FRAMES: i64 = 6;
+
 /// Which frames playback asks for, given the per-frame render cost (s), the displayed frame rate
 /// and the worker count: `(lead, stride)`. While the workers keep up, every frame from the
 /// playhead on (`(1, 1)`). When they cannot (CPU effects slower than real time), `lead` is the
@@ -600,10 +609,11 @@ impl FrameServer {
             j.prefetch &= prefetch;
             j.reduced &= reduced;
             // the playhead only moves on: the newest (smallest) margin
-            j.catch_up = match (j.catch_up, catch_up) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
+            if catch_up.is_some() {
+                // measured now: replaces the older measurement (the playhead only moves on)
+                j.catch_up = catch_up;
+                j.catch_up_at = Instant::now();
+            }
             drop(q);
             hit();
             return;
@@ -626,7 +636,19 @@ impl FrameServer {
                 }
             }
         }
-        q.push_back(Job { key, queued: Instant::now(), cancel: Default::default(), prefetch, catch_up, time, scale, project: project.clone(), prio, reduced });
+        q.push_back(Job {
+            key,
+            queued: Instant::now(),
+            cancel: Default::default(),
+            prefetch,
+            catch_up,
+            catch_up_at: Instant::now(),
+            time,
+            scale,
+            project: project.clone(),
+            prio,
+            reduced,
+        });
         drop(q);
         self.shared.cv.notify_one();
     }
@@ -660,7 +682,7 @@ impl FrameServer {
         }
         let (target, rev, cur) = (key.target, key.revision, key.frame);
         let span = (lead + ahead * stride) * step + 26;
-        self.retain_queue(|k| k.target != target || (k.revision == rev && (k.frame - cur) * dir >= 0 && (k.frame - cur).abs() < span));
+        self.retain_queue(|k| k.target != target || (k.revision == rev && (k.frame - cur) * dir >= -LATE_HOLD_FRAMES && (k.frame - cur).abs() < span));
     }
 
     /// Whether playback can start at `key`: the next [`PREROLL_FRAMES`] frames (up to `last`)
@@ -890,7 +912,7 @@ fn run_job(sh: &Shared, job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Ser
     let _ = filmcraft_media::pending::take();
     let mut loading = false;
     let preview = filmcraft_media::cancel::with_cancel(&job.cancel, || {
-        filmcraft_media::cancel::with_catch_up(job.catch_up, || {
+        filmcraft_media::cancel::with_catch_up_since(job.catch_up, job.catch_up_at, || {
             filmcraft_media::cancel::with_draft(job.key.draft, || {
                 filmcraft_media::cancel::with_background(is_background(job), || {
                     if let Target::SequencePlan(seq) = job.key.target {

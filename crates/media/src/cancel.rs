@@ -8,7 +8,10 @@
 //!
 //! The same way, [`with_catch_up`] tells sources which frames before the requested one are late
 //! (playback has passed them): a decoder that has to decode forward to the frame may skip
-//! pictures that only produce late frames and that nothing else references.
+//! pictures that only produce late frames and that nothing else references, or, far behind,
+//! jump to a later keyframe. The margin is measured at an instant and shrinks as playback moves
+//! on, so a request that waited (in a queue, or for a decoder another request is using) sees
+//! where the playhead is now, not where it was when the request was made.
 //!
 //! [`with_draft`] marks reduced-resolution playback (opt-in): decoders may take spec-safe
 //! shortcuts that only change pictures nothing references (H.264: no deblocking of non-reference
@@ -23,10 +26,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use filmcraft_time::Tick;
+use web_time::Instant;
 
 thread_local! {
     static CURRENT: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
-    static CATCH_UP: Cell<Option<Tick>> = const { Cell::new(None) };
+    static CATCH_UP: Cell<Option<(Tick, Instant)>> = const { Cell::new(None) };
     static DRAFT: Cell<bool> = const { Cell::new(false) };
     static BACKGROUND: Cell<bool> = const { Cell::new(false) };
     static REDUCED: Cell<bool> = const { Cell::new(false) };
@@ -89,20 +93,27 @@ pub fn draft() -> bool {
     DRAFT.with(Cell::get)
 }
 
-/// Run `f` with the catch-up hint `margin` (restoring the previous one after): frames shown more
-/// than `margin` before the requested time are late (`Some(Tick::ZERO)`: everything before it).
-/// The margin is measured in media time at normal speed; a wrong guess (a sped-up or reversed
-/// clip) only costs a later re-seek, never a wrong frame.
+/// Run `f` with the catch-up hint `margin` measured now (see [`with_catch_up_since`]).
 pub fn with_catch_up<R>(margin: Option<Tick>, f: impl FnOnce() -> R) -> R {
-    let prev = CATCH_UP.with(|c| c.replace(margin));
+    with_catch_up_since(margin, Instant::now(), f)
+}
+
+/// Run `f` with the catch-up hint `margin` (restoring the previous one after): at `since`,
+/// frames shown more than `margin` before the requested time were late (`Some(Tick::ZERO)`:
+/// everything before it). The margin is measured in media time at normal speed; a wrong guess (a
+/// sped-up or reversed clip) only costs a later re-seek or a dropped frame, never a wrong frame.
+pub fn with_catch_up_since<R>(margin: Option<Tick>, since: Instant, f: impl FnOnce() -> R) -> R {
+    let prev = CATCH_UP.with(|c| c.replace(margin.map(|m| (m, since))));
     let r = f();
     CATCH_UP.with(|c| c.set(prev));
     r
 }
 
-/// The catch-up margin of the work running on this thread (None: no frame is late).
+/// The catch-up margin of the work running on this thread now (None: no frame is late): the
+/// margin given, less the time since it was measured (negative once the requested frame itself
+/// is late).
 pub fn catch_up() -> Option<Tick> {
-    CATCH_UP.with(Cell::get)
+    CATCH_UP.with(Cell::get).map(|(m, since)| m - Tick::from_seconds_f64(since.elapsed().as_secs_f64()))
 }
 
 /// Run `f` with `flag` as this thread's cancellation flag (restoring the previous one after).
@@ -123,7 +134,7 @@ pub fn cancelled() -> bool {
 #[derive(Clone, Default)]
 pub struct Context {
     cancel: Option<Arc<AtomicBool>>,
-    catch_up: Option<Tick>,
+    catch_up: Option<(Tick, Instant)>,
     draft: bool,
     background: bool,
 }
@@ -131,7 +142,7 @@ pub struct Context {
 impl Context {
     /// This thread's hints.
     pub fn current() -> Self {
-        Context { cancel: CURRENT.with(|c| c.borrow().clone()), catch_up: catch_up(), draft: draft(), background: background() }
+        Context { cancel: CURRENT.with(|c| c.borrow().clone()), catch_up: CATCH_UP.with(Cell::get), draft: draft(), background: background() }
     }
 
     /// Run `f` with these hints, restoring this thread's however `f` ends (a pool thread must
@@ -160,6 +171,11 @@ impl Context {
 mod tests {
     use super::*;
 
+    /// A live margin given as `m` a moment ago (the test's own run time off it).
+    fn about(live: Option<Tick>, m: Tick) -> bool {
+        live.is_some_and(|l| l <= m && l > m - Tick::from_seconds_f64(5.0))
+    }
+
     #[test]
     fn context_carries_the_hints_to_another_thread_and_restores_its_own() {
         let flag = Arc::new(AtomicBool::new(true));
@@ -167,7 +183,8 @@ mod tests {
         std::thread::scope(|s| {
             s.spawn(|| {
                 let seen = with_draft(false, || ctx.clone().run(|| (cancelled(), draft(), background(), catch_up())));
-                assert_eq!(seen, (true, true, true, Some(Tick(5))));
+                assert_eq!((seen.0, seen.1, seen.2), (true, true, true));
+                assert!(about(seen.3, Tick(5)));
                 // a panic inside leaves this thread's own hints in place
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.clone().run(|| panic!("job"))));
                 assert!(r.is_err());
@@ -221,10 +238,19 @@ mod tests {
     fn catch_up_is_scoped_to_the_closure() {
         assert_eq!(catch_up(), None);
         with_catch_up(Some(Tick(5)), || {
-            assert_eq!(catch_up(), Some(Tick(5)));
+            assert!(about(catch_up(), Tick(5)));
             with_catch_up(None, || assert_eq!(catch_up(), None));
-            assert_eq!(catch_up(), Some(Tick(5)));
+            assert!(about(catch_up(), Tick(5)));
         });
         assert_eq!(catch_up(), None);
+    }
+
+    #[test]
+    fn the_margin_shrinks_as_time_passes() {
+        let a_second_ago = Instant::now() - std::time::Duration::from_secs(1);
+        with_catch_up_since(Some(Tick::ZERO), a_second_ago, || {
+            // the requested frame itself has been late for a second
+            assert!(catch_up().is_some_and(|m| m <= -Tick::from_seconds_f64(1.0)));
+        });
     }
 }

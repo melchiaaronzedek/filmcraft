@@ -451,8 +451,8 @@ impl MediaSource for MxfSource {
         }
         let rate = self.info.frame_rate();
         let f = rate.frame_at(req.time.max(Tick::ZERO)).clamp(0, self.vcount - 1);
-        let late = filmcraft_media::cancel::catch_up().map(|m| self.vfirst + rate.frame_at(req.time - m));
-        let frame = self.video.frame_late(&MxfVideo { src: self, track: ti }, self.vfirst + f, late)?;
+        let late = || filmcraft_media::cancel::catch_up().map(|m| self.vfirst + rate.frame_at(req.time - m));
+        let frame = self.video.frame_late(&MxfVideo { src: self, track: ti }, self.vfirst + f, &late)?;
         Ok(frame)
     }
 

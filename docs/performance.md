@@ -80,6 +80,61 @@ What remains per live decoder is unchanged: the H.264 decoder publishes each mac
 picture as its own allocations (`Frame::make_row`, five per row), which is where the 290 MB per
 decoder comes from.
 
+## 4K 10-bit 4:2:2 HEVC in real time on a 15 W laptop (PERF6)
+
+Same machine and clip as MEM5 below: Ryzen 7 7730U (8 cores / 16 threads, 15 W, Radeon Vega 7
+iGPU), Fujifilm X-S20 HEVC Main 4:2:2 10 at 3840x2160, 23.976 fps, 87 Mbit/s, LongGOP (a
+sync sample every 24 frames, P pictures only). No GPU in this class decodes HEVC 4:2:2 (AMD
+none, NVIDIA from Blackwell, Intel from 11th gen): it is software or nothing.
+
+### The decoder (`crates/hevc/examples/hevcdec.rs`, 144 pictures, bit-exact with ffmpeg)
+
+| | 1 thread | all threads, app memory cap (~490 MB) |
+|---|---|---|
+| before | 23.4 s (6.2 fps) | 21.4 fps |
+| partial-butterfly inverse transforms; MC, deblocking, SAO, IDCT dispatched per instruction set at run time (`fearless_simd`, `crate::simd`) | 20.8 s | |
+| dequantize / reconstruct dispatched too; flat-matrix scaling loop; DC-only add without a fill; table-driven `sig_coeff_flag` contexts | **18.2 s (7.9 fps)** | **26.2 fps** |
+| ffmpeg 4.4 (hand-written assembly), for reference | 3.8 s / 48 = 12.6 fps | 36 fps |
+
+The serial entropy decoder (CABAC: ~18 % of single-thread time) and copies of decoded rows that
+cannot be avoided without `unsafe` (reference blocks for full-sample motion, output pictures)
+are most of what is left. Run `HEVC_THREADS=1 HEVC_LOOPS=3 hevcdec clip.hevc` to compare.
+
+### Playback (`bench_playback --scenario files-seq --media clip.mov`, 12 s clip, 10 s plays)
+
+Decoding a little faster than real time on its own was not enough inside the app (it shares the
+CPU and the 15 W with the GPU compositor), and when decoding fell even 3 % short the monitor
+showed almost nothing:
+
+| frames shown on time (of ~240) | before | after |
+|---|---|---|
+| monitor drawn at 1/2 (a laptop screen) | 28 (10 %) | **203–223 (80–90 %)** |
+| monitor at 1:1 (4K drawn in full) | 15–18 (5–6 %) | 46–51 (~24 %, GPU-bound: 52 ms to upload and draw a 4K frame on this iGPU) |
+
+What changed:
+
+- **Playback plans at the size drawn.** Reduced-resolution playback box-filtered planes to twice
+  the size drawn, so 4K in a monitor drawn at 1/2 still uploaded and drew every sample:
+  ~50 ms a frame on the iGPU. It now prepares, uploads and draws the drawn size (a quarter of
+  the samples at 1/2): 14 ms. A paused frame is rendered in full as before.
+- **Late frames are still shown.** Jobs for frames the playhead passed were cancelled at once,
+  though the monitor shows a frame up to `LATE_HOLD_FRAMES` (6) behind: with decoding just
+  under real time every job was cancelled and the monitor showed a handful of distinct frames
+  per second.
+- **A live catch-up deadline.** `filmcraft_media::cancel::catch_up` is measured at an instant
+  and shrinks as playback moves on; the frame cache reads it once it has the decoder, so a
+  request that waited in the queue or behind another decode sees the playhead now.
+- **Catch-up jumps** (`GopCache::catch_up`): when the decoder's newest frame is more than 6
+  frames behind the playhead, it restarts at the first sync sample at least 12 frames ahead
+  (at most 2 s), and requests for the frames between are given up (not cached as results).
+  A second or so is dropped at a GOP boundary instead of every following frame arriving late.
+- **Decoded frames without waiting for the decoder.** A request whose frame another request
+  has already decoded is answered from the cache while that request still holds the decoder.
+- **Memory budget moved to the decoder.** The decoder's share went from 4 % (640 MB max) to 7 %
+  (1 GiB max), about ten 4K pictures in flight instead of six, which keeps decoding above real
+  time while playing; the decoded-frame cache went from 12 % to 8 % (2 GiB max). Resident
+  memory while playing is unchanged (~3.0 GB).
+
 ## Memory governor: two 4K 10-bit 4:2:2 clips on a 16 GB laptop (MEM5)
 
 Two Fujifilm X-S20 clips (HEVC Main 4:2:2 10, 3840x2160, decoded in software: VA-API declines

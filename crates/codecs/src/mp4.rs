@@ -359,8 +359,8 @@ impl Mp4Source {
         let ts = self.file.tracks[ti].timescale as i64;
         // Nearest, not floor: with a coarse timescale (1000) sample times are rounded, and a
         // floored lookup lands one unit short of every frame whose time was rounded up.
-        let late = filmcraft_media::cancel::catch_up().map(|m| (t - m).to_rational_round(1, ts));
-        self.video.frame_late(&Mp4Video { src: self, track: ti }, t.to_rational_round(1, ts), late)
+        let late = || filmcraft_media::cancel::catch_up().map(|m| (t - m).to_rational_round(1, ts));
+        self.video.frame_late(&Mp4Video { src: self, track: ti }, t.to_rational_round(1, ts), &late)
     }
 
     /// Decoded packet `i` of audio stream `a` (`ainfo` is its `AudioStreamInfo`; `st` its decoder state).
