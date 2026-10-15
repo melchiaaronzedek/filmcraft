@@ -3585,3 +3585,13 @@
 	Shows the version, community links and credits in a FilmCraft window.	在 FilmCraft 窗口中显示版本、社区链接和致谢。
 	Couldn't open your web browser	无法打开网页浏览器
 	Open this address in your browser yourself:	请自行在浏览器中打开此地址：
+	Buffering…	正在缓冲…
+	Click to dismiss	单击关闭
+	Click to reset	单击重置
+	Create Proxies ({n})	创建代理 ({n})
+	Don't show again this session	本次会话不再显示
+	Dropped frames:	丢帧：
+	Pixel Format	像素格式
+	Playback is dropping frames: this footage is decoded on the CPU.	播放正在丢帧：此素材由 CPU 解码。
+	Proxies play it smoothly; exports still use the original media.	使用代理可流畅播放；导出仍使用原始媒体。
+	Rendering…	正在渲染…

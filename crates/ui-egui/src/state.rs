@@ -543,6 +543,10 @@ pub struct UiState {
     /// Create Proxies dialog (open when Some).
     #[serde(default)]
     pub create_proxies: Option<ProxyDraft>,
+    /// The Program monitor's advice to create proxies for heavy media was dismissed (this
+    /// session).
+    #[serde(default)]
+    pub heavy_media_advice_dismissed: bool,
     /// Project Manager dialog (open when Some).
     #[serde(default)]
     pub project_manager: Option<ProjectManagerDraft>,
@@ -1002,6 +1006,7 @@ impl Default for UiState {
             pen_points: vec![],
             link_media: None,
             create_proxies: None,
+            heavy_media_advice_dismissed: false,
             project_manager: None,
             make_offline: None,
             color_dialog: None,

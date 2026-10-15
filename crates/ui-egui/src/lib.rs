@@ -263,6 +263,17 @@ const SCREENSHOT_SETTLE_MAX_S: f64 = 5.0;
 /// system RAM): enough for a timeline full of filmstrips and the Project panel's icons.
 const MAX_THUMB_TEXTURES: usize = 400;
 
+/// Seconds an information notification stays on screen (errors stay until clicked).
+const TOAST_SECS: f64 = 5.0;
+
+/// Whether a status-bar message reports a failure (drawn in the error colour instead of as a hint).
+fn status_is_error(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    ["error", "failed", "cannot", "can't", "could not", "unable", "not found", "missing", "invalid", "unsupported", "unreadable", "offline"]
+        .iter()
+        .any(|w| l.contains(w))
+}
+
 /// Export entries that run from the menus through the save panel: command, filter label,
 /// extension.
 pub(crate) const EXPORT_SAVE_DIALOGS: [(&str, &str, &str); 7] = [
@@ -371,7 +382,10 @@ pub struct FilmcraftApp {
     menu_sent: Vec<menus::MenuItem>,
     /// Keyboard Shortcuts dialog state.
     pub shortcut_editor: panels::shortcuts_dialog::EditorState,
-    pub toast: Option<(String, f64)>,
+    /// A notification from the engine (auto-save failed, media missing, export queue finished…):
+    /// message, time shown (s), error. Drawn above the status bar ([`Self::draw_toast`]): an
+    /// information disappears after [`TOAST_SECS`], an error stays until it is clicked.
+    pub toast: Option<(String, f64, bool)>,
     pub tl: panels::timeline::TlState,
     pub(crate) transcript_cache: panels::transcript_cache::TranscriptCache,
     /// Commands from outside the UI (native menu bar), invoked on the UI thread.
@@ -1735,10 +1749,10 @@ impl FilmcraftApp {
             match r {
                 Ok(r) => {
                     if let Some(n) = r["refreshed"].as_array().map(Vec::len).filter(|n| *n > 0) {
-                        self.toast = Some((format!("Refreshed {n} media item(s) changed on disk"), ctx.input(|i| i.time)));
+                        self.toast = Some((format!("Refreshed {n} media item(s) changed on disk"), ctx.input(|i| i.time), false));
                     }
                 }
-                Err(e) => self.toast = Some((e.to_string(), ctx.input(|i| i.time))),
+                Err(e) => self.toast = Some((e.to_string(), ctx.input(|i| i.time), true)),
             }
         }
         let media = &self.session.prefs.media;
@@ -1793,7 +1807,7 @@ impl FilmcraftApp {
                     let _ = self.apply_dock(craft_ui::docking::Action::Activate { panel: PanelKind::Source });
                 }
                 filmcraft_engine::Event::RevealInProject(item) => self.reveal_in_project(item),
-                filmcraft_engine::Event::Toast { message, .. } => self.toast = Some((message, ctx.input(|i| i.time))),
+                filmcraft_engine::Event::Toast { message, error } => self.toast = Some((message, ctx.input(|i| i.time), error)),
                 filmcraft_engine::Event::ProjectChanged { .. } => {}
             }
         }
@@ -1839,6 +1853,8 @@ impl FilmcraftApp {
         // the Timeline has had its chance to place a file drop this frame; anything left stays a bin import
         self.pending_timeline_drop = None;
         panels::dialogs::show(self, &ctx);
+        let status_h_shown = if self.ui.show_status_bar { status_h } else { 0.0 };
+        self.draw_toast(&ctx, full, status_h_shown);
         if !self.ui.show_status_bar {
             // no bar to draw the job in, but a finished preview render still plays
             self.watch_jobs(ui.ctx());
@@ -1857,13 +1873,66 @@ impl FilmcraftApp {
                 ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
             }
         }
-        let hint = if !self.ui.status.is_empty() { self.ui.status.clone() } else { self.hint_text() };
-        ui.painter().text(egui::pos2(sb.min.x + 10.0, sb.center().y), egui::Align2::LEFT_CENTER, hint, Tokens::ui(11.0), t.text_dim);
+        let (hint, colour) = if !self.ui.status.is_empty() {
+            // a failure reads as one, not as a tool hint
+            let colour = if status_is_error(&self.ui.status) { t.render_red } else { t.text };
+            (self.ui.status.clone(), colour)
+        } else {
+            (self.hint_text(), t.text_dim)
+        };
+        ui.painter().text(egui::pos2(sb.min.x + 10.0, sb.center().y), egui::Align2::LEFT_CENTER, hint, Tokens::ui(11.0), colour);
         let resp = ui.interact(sb, egui::Id::new("status-bar"), egui::Sense::click());
         if resp.clicked() {
             self.ui.status.clear();
         }
         self.job_status(ui, sb, &t);
+    }
+
+    /// The engine's notification (see [`Self::toast`]), as a rounded card at the bottom right above
+    /// the status bar. Clicking it dismisses it.
+    fn draw_toast(&mut self, ctx: &egui::Context, full: egui::Rect, status_h: f32) {
+        let Some((message, shown, error)) = self.toast.clone() else { return };
+        let now = ctx.input(|i| i.time);
+        if !error && now - shown > TOAST_SECS {
+            self.toast = None;
+            return;
+        }
+        let t = self.tokens;
+        let font = Tokens::ui(12.0);
+        let max_w = (full.width() * 0.4).clamp(220.0, 520.0);
+        let galley = ctx.fonts_mut(|f| f.layout(message.clone(), font, t.text, max_w));
+        let pad = egui::vec2(14.0, 10.0);
+        let accent_w = 4.0;
+        let size = galley.size() + pad * 2.0 + egui::vec2(accent_w, 0.0);
+        let rect = egui::Rect::from_min_size(egui::pos2(full.max.x - size.x - 16.0, full.max.y - status_h - size.y - 12.0), size);
+        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("app-toast"));
+        let painter = ctx.layer_painter(layer);
+        // fade in over 150 ms (out for an information over its last 300 ms)
+        let age = (now - shown) as f32;
+        let fade = (age / 0.15).min(1.0) * if error { 1.0 } else { ((TOAST_SECS as f32 - age) / 0.3).clamp(0.0, 1.0) };
+        let alpha = |c: egui::Color32| c.gamma_multiply(fade);
+        painter.rect_filled(rect.translate(egui::vec2(0.0, 2.0)), 8.0, alpha(egui::Color32::from_black_alpha(90)));
+        painter.rect_filled(rect, 8.0, alpha(t.panel_bg));
+        painter.rect_stroke(rect, 8.0, egui::Stroke::new(1.0, alpha(t.separator)), egui::StrokeKind::Inside);
+        let accent = egui::Rect::from_min_size(rect.min, egui::vec2(accent_w, rect.height()));
+        painter.rect_filled(accent, egui::CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 }, alpha(if error { t.render_red } else { t.accent }));
+        painter.galley(rect.min + pad + egui::vec2(accent_w, 0.0), galley, alpha(t.text));
+        let resp = egui::Area::new(egui::Id::new("app-toast-hit"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| ui.allocate_rect(egui::Rect::from_min_size(ui.min_rect().min, rect.size()), egui::Sense::click()))
+            .inner;
+        self.auto.add("app.toast", rect, &message);
+        if resp.clicked() {
+            self.toast = None;
+            return;
+        }
+        if error {
+            resp.on_hover_text(tl!("Click to dismiss"));
+        } else {
+            // repaint for the fade and the time-out
+            ctx.request_repaint_after(std::time::Duration::from_millis(if age < 0.2 || TOAST_SECS as f32 - age < 0.4 { 16 } else { 250 }));
+        }
     }
 
     /// The running job (export / render previews), if any; plays the rendered range when a preview

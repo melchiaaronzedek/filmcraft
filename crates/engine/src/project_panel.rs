@@ -218,7 +218,7 @@ pub const DEFAULT_COLUMNS: [&str; 12] = [
 ];
 
 /// Every built-in column (Metadata Display ▸ Project Metadata), in display order.
-pub const BUILTIN_COLUMNS: [&str; 36] = [
+pub const BUILTIN_COLUMNS: [&str; 37] = [
     "Name",
     "Label",
     "Media Type",
@@ -236,6 +236,7 @@ pub const BUILTIN_COLUMNS: [&str; 36] = [
     "Subclip End",
     "Video Info",
     "Video Codec",
+    "Pixel Format",
     "Audio Info",
     "Audio Codec",
     "Color Space",
@@ -382,6 +383,9 @@ pub fn cell(p: &Project, it: &ProjectItem, column: &str) -> (String, SortKey) {
             _ => text(String::new()),
         },
         "Video Codec" => text(media.and_then(|m| m.info.video.as_ref()).map(|v| v.codec.clone()).unwrap_or_default()),
+        // chroma subsampling and bit depth ("YUV 4:2:2 10-bit"): what decides whether the GPU can
+        // decode a camera clip
+        "Pixel Format" => text(media.and_then(|m| m.info.video.as_ref()).map(|v| v.pixel_format.clone()).unwrap_or_default()),
         "Audio Info" => text(
             media
                 .and_then(|m| m.info.audio())

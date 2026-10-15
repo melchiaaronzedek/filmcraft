@@ -3609,3 +3609,13 @@
 	Shows the version, community links and credits in a FilmCraft window.	バージョン、コミュニティへのリンク、クレジットを FilmCraft のウィンドウに表示します。
 	Couldn't open your web browser	ウェブブラウザーを開けませんでした
 	Open this address in your browser yourself:	このアドレスをご自身でブラウザーで開いてください：
+	Buffering…	バッファリング中…
+	Click to dismiss	クリックして閉じる
+	Click to reset	クリックしてリセット
+	Create Proxies ({n})	プロキシを作成 ({n})
+	Don't show again this session	このセッションでは表示しない
+	Dropped frames:	ドロップフレーム:
+	Pixel Format	ピクセル形式
+	Playback is dropping frames: this footage is decoded on the CPU.	再生中にフレームがドロップしています：この素材は CPU でデコードされています。
+	Proxies play it smoothly; exports still use the original media.	プロキシならスムーズに再生できます。書き出しには元のメディアが使われます。
+	Rendering…	レンダリング中…

@@ -3610,3 +3610,13 @@
 	Shows the version, community links and credits in a FilmCraft window.	Muestra la versión, los enlaces de la comunidad y los créditos en una ventana de FilmCraft.
 	Couldn't open your web browser	No se pudo abrir el navegador web
 	Open this address in your browser yourself:	Abre esta dirección tú mismo en el navegador:
+	Buffering…	Almacenando en búfer…
+	Click to dismiss	Haz clic para cerrar
+	Click to reset	Haz clic para restablecer
+	Create Proxies ({n})	Crear proxies ({n})
+	Don't show again this session	No volver a mostrar en esta sesión
+	Dropped frames:	Fotogramas perdidos:
+	Pixel Format	Formato de píxel
+	Playback is dropping frames: this footage is decoded on the CPU.	La reproducción pierde fotogramas: este material se decodifica en la CPU.
+	Proxies play it smoothly; exports still use the original media.	Con proxies se reproduce con fluidez; las exportaciones siguen usando los medios originales.
+	Rendering…	Procesando…

@@ -50,7 +50,9 @@ struct Cache {
 }
 
 const PREVIEW_BASE: u64 = 1 << 44;
-const CACHE_SECS: f64 = 3.0;
+/// How long a directory listing is reused. Listing a camera card's folder (an SD card reader) on the
+/// UI thread every few seconds made the panel hitch; Refresh and navigation list again at once.
+const CACHE_SECS: f64 = 10.0;
 const ROW_H: f32 = 22.0;
 
 fn cache_id() -> egui::Id {
@@ -526,7 +528,9 @@ fn list(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, entries: &[Entry], c
             } else if i % 2 == 1 {
                 ui.painter().rect_filled(rr, 0.0, t.row_alt);
             }
-            let info = if needs_probe && !e.is_dir {
+            // (rows scrolled out of view are not probed: each probe opens and parses the file on
+            // this thread)
+            let info = if needs_probe && !e.is_dir && ui.is_rect_visible(rr) {
                 let cached = app.session.browser.probes.contains_key(&e.path);
                 if cached || probes_left > 0 {
                     if !cached {
