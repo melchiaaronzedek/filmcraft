@@ -95,6 +95,10 @@ pub struct Decoder {
     pool: Option<rayon::ThreadPool>,
     in_flight: VecDeque<FrameRef>,
     max_in_flight: usize,
+    /// Bytes the pictures in flight may hold together ([`Decoder::set_memory_limit`]).
+    memory_limit: Option<usize>,
+    /// Pictures in flight allowed for the current stream (`max_in_flight` or fewer).
+    in_flight_cap: usize,
     threads: usize,
     /// Draft mode: skip deblocking of non-reference pictures ([`Decoder::set_draft`]).
     draft: bool,
@@ -155,9 +159,41 @@ impl Decoder {
             pool,
             in_flight: VecDeque::new(),
             max_in_flight: threads.max(1) + 2,
+            memory_limit: None,
+            in_flight_cap: threads.max(1) + 2,
             threads: workers,
             draft: false,
         }
+    }
+
+    /// Limit the memory of the pictures decoded in parallel (frame threading) to about `bytes`:
+    /// each picture in flight holds its samples and per-macroblock state, so the default
+    /// `threads + 2` pictures of a 16-thread decoder take ~0.5 GB at 4K. Fewer pictures in flight
+    /// cost little speed; at least two always run. `None`: no limit (the default).
+    pub fn set_memory_limit(&mut self, bytes: Option<usize>) {
+        self.memory_limit = bytes;
+        self.in_flight_cap = self.max_in_flight;
+        if let Some(sps) = self.active_sps.clone() {
+            self.update_in_flight_cap(&sps);
+        }
+    }
+
+    fn update_in_flight_cap(&mut self, sps: &Sps) {
+        self.in_flight_cap = match self.memory_limit {
+            Some(limit) => {
+                let (w, h) = (sps.width() as usize, sps.height() as usize);
+                // 8-bit 4:2:0 samples, twice (decoding state and published picture), plus about
+                // a byte per sample of per-macroblock state
+                let per = w.saturating_mul(h).saturating_mul(3).max(1);
+                (limit / per).clamp(2, self.max_in_flight.max(2))
+            }
+            None => self.max_in_flight,
+        };
+    }
+
+    /// Pictures that may be in flight now (see [`Decoder::set_memory_limit`]).
+    pub fn in_flight_limit(&self) -> usize {
+        self.in_flight_cap
     }
 
     /// Worker threads decoding pictures (1: on the calling thread).
@@ -240,7 +276,7 @@ impl Decoder {
         }
         result?;
         // Return finished pictures without blocking on frames still being decoded (bounded latency).
-        let max_queue = self.max_in_flight * 2;
+        let max_queue = self.in_flight_cap * 2;
         let mut pics = Vec::new();
         while let Some(o) = self.out_queue.front() {
             if !o.frame.is_published(o.frame.mb_h() - 1) && self.out_queue.len() <= max_queue {
@@ -412,6 +448,9 @@ impl Decoder {
             self.emit(outs);
             self.dpb.entries.clear();
         }
+        if changed {
+            self.update_in_flight_cap(sps);
+        }
         self.active_sps = Some(sps.clone());
         self.dpb.capacity = sps.max_dpb_frames();
         self.dpb.max_reorder = sps.max_num_reorder_frames().min(self.dpb.capacity);
@@ -485,7 +524,7 @@ impl Decoder {
         #[cfg(feature = "threads")]
         if let Some(pool) = &self.pool {
             self.in_flight.retain(|f| !f.is_published(f.mb_h() - 1));
-            while self.in_flight.len() >= self.max_in_flight {
+            while self.in_flight.len() >= self.in_flight_cap {
                 if let Some(f) = self.in_flight.pop_front() {
                     f.wait_complete();
                 }

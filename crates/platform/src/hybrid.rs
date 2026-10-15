@@ -162,7 +162,10 @@ impl HybridDecoder {
                 Err(e) => log::warn!("software replay after the hardware decoder failed: {e}"),
             }
         }
-        self.log = Some(log);
+        // The software decoder carries on from here: the log is never replayed again (up to
+        // 256 MB of samples held for nothing until the next seek).
+        drop(log);
+        self.log_bytes = 0;
         match rejected {
             None => Ok(self.merge(frames)),
             Some(e) => {

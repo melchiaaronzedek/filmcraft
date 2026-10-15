@@ -29,6 +29,7 @@ thread_local! {
     static CATCH_UP: Cell<Option<Tick>> = const { Cell::new(None) };
     static DRAFT: Cell<bool> = const { Cell::new(false) };
     static BACKGROUND: Cell<bool> = const { Cell::new(false) };
+    static REDUCED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Run `f` as background work when `on` (restoring the previous hint after): a thumbnail, not a
@@ -50,6 +51,27 @@ pub fn with_background<R>(on: bool, f: impl FnOnce() -> R) -> R {
 /// [`with_background`]`(true, …)`).
 pub fn background() -> bool {
     BACKGROUND.with(Cell::get)
+}
+
+/// Run `f` with the reduced-resolution hint `on` (restoring the previous one after, also on a
+/// panic): playback, which may hand the compositor source pictures box-filtered to twice the
+/// size drawn instead of whole 4K frames. Its results are only shown while playing; a paused
+/// frame is rendered again without it.
+pub fn with_reduced_resolution<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REDUCED.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(REDUCED.with(|c| c.replace(on)));
+    f()
+}
+
+/// Whether the work running on this thread may use reduced-resolution source pictures (off
+/// unless inside [`with_reduced_resolution`]`(true, …)`).
+pub fn reduced_resolution() -> bool {
+    REDUCED.with(Cell::get)
 }
 
 /// Run `f` with the draft-decoding hint `on` (restoring the previous one after). Frames decoded

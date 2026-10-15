@@ -161,6 +161,10 @@ struct State {
     /// used the decoder since it was made: it is given up as soon as another background request
     /// is done, whatever the caches' recency.
     background: bool,
+    /// When a monitor (a request that is not background work) last asked for a frame: while it
+    /// is recent, background requests leave the decoder and the pin alone (see
+    /// [`GopCache::frame_late`]).
+    foreground_used: Option<Instant>,
 }
 
 impl State {
@@ -273,7 +277,14 @@ struct Pool {
     /// Bytes of the frames the caches hold.
     bytes: AtomicUsize,
     budget: usize,
+    /// The budget comes from the memory governor (`filmcraft_frame::memory`) instead of `budget`.
+    governed: bool,
+    /// Caches in use (see [`Pool::in_use`]), counted at most every [`IN_USE_REFRESH`].
+    in_use: Mutex<Option<(Instant, usize)>>,
 }
+
+/// How long a count of the caches in use is reused (it is asked for per stored frame).
+const IN_USE_REFRESH: Duration = Duration::from_millis(200);
 
 /// The part of a [`GopCache`] its pool reaches.
 struct Shared {
@@ -309,7 +320,42 @@ impl Pool {
             hard_decoders: max_decoders,
             bytes: AtomicUsize::new(0),
             budget,
+            governed: false,
+            in_use: Mutex::new(None),
         }
+    }
+
+    /// Take the frame budget from the memory governor (the process pool).
+    fn governed(mut self) -> Self {
+        self.governed = true;
+        self
+    }
+
+    /// Bytes of frames all caches may hold together now.
+    fn budget(&self) -> usize {
+        if self.governed { filmcraft_frame::memory::Budget::DECODED_FRAMES.bytes() } else { self.budget }
+    }
+
+    /// Caches that hold frames and were asked for one within [`Pool::recent`] (a cache that is
+    /// decoding right now counts too): they share the frame budget.
+    fn in_use(&self) -> usize {
+        let mut last = self.in_use.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((at, n)) = *last
+            && at.elapsed() < IN_USE_REFRESH
+        {
+            return n;
+        }
+        let all: Vec<Arc<Shared>> = self.caches.lock().unwrap_or_else(PoisonError::into_inner).iter().filter_map(Weak::upgrade).collect();
+        let n = all
+            .iter()
+            .filter(|c| match try_state(c) {
+                Some(st) => !st.frames.is_empty() && st.last_used.elapsed() < self.recent,
+                None => true,
+            })
+            .count()
+            .max(1);
+        *last = Some((Instant::now(), n));
+        n
     }
 
     /// Caches idle for `recent` (< the idle time) are still trimmed, down to `hard_decoders`.
@@ -322,7 +368,7 @@ impl Pool {
     /// The pool of every cache in the process.
     fn global() -> Arc<Pool> {
         static POOL: std::sync::OnceLock<Arc<Pool>> = std::sync::OnceLock::new();
-        POOL.get_or_init(|| Arc::new(Pool::new(MAX_LIVE_DECODERS, IDLE, FRAME_BUDGET).tiered(RECENT, HARD_DECODERS))).clone()
+        POOL.get_or_init(|| Arc::new(Pool::new(MAX_LIVE_DECODERS, IDLE, FRAME_BUDGET).tiered(RECENT, HARD_DECODERS).governed())).clone()
     }
 
     fn register(&self, c: &Arc<Shared>) {
@@ -395,7 +441,8 @@ impl Pool {
     /// budget. Caches in use keep theirs (each within its own budget): a frame evicted before it is shown costs a
     /// re-decode from the keyframe.
     fn trim_frames(&self, me: &Shared) {
-        let over = || self.bytes.load(Ordering::Relaxed) > self.budget;
+        let budget = self.budget();
+        let over = || self.bytes.load(Ordering::Relaxed) > budget;
         if !over() {
             return;
         }
@@ -420,6 +467,12 @@ pub fn cached_bytes() -> usize {
     Pool::global().bytes.load(Ordering::Relaxed)
 }
 
+/// Bytes of decoded frames the caches may hold together now (from the memory governor;
+/// `perf.stats`).
+pub fn frame_budget() -> usize {
+    Pool::global().budget()
+}
+
 /// Decoder + decoded-frame cache for one video track.
 pub struct GopCache {
     shared: Arc<Shared>,
@@ -432,11 +485,17 @@ pub struct GopCache {
     budget: usize,
 }
 
-/// The cache always has room for this many frames, whatever their size: a frame-threaded decoder
-/// runs up to ~2x its thread count ahead of the frame it returns, and playback prefetches ahead
-/// of the playhead, so a byte budget alone would evict 4K frames before they are shown and force
-/// a re-decode from the keyframe.
+/// A cache holds up to this many frames, more only when they are small (its own byte budget): a
+/// frame-threaded decoder runs ahead of the frame it returns, and playback prefetches ahead of
+/// the playhead.
 const MIN_FRAMES: usize = 64;
+
+/// A cache in use always has room for this many frames, however many caches share the budget:
+/// playback asks for up to 14 frames ahead of the playhead at normal speed (the frame workers
+/// take them out of order), and a byte budget alone would evict 4K frames before they are shown
+/// and force a re-decode from the keyframe. Frames already composited live on in the monitors'
+/// plans, so the cache only has to bridge that window.
+const FLOOR_FRAMES: usize = 16;
 
 /// A running decoder up to this many samples before the wanted sample's sync sample keeps going
 /// rather than restarting at the sync sample.
@@ -515,6 +574,7 @@ impl GopCache {
                 last_used: Instant::now(),
                 pin: i64::MIN,
                 background: false,
+                foreground_used: None,
             }),
             pool: pool.clone(),
         });
@@ -563,7 +623,13 @@ impl GopCache {
         } else {
             st.drafts.remove(&pts);
         }
-        let budget = self.budget.max(MIN_FRAMES * f.byte_size());
+        // Its share of the frames all caches may hold (the memory governor's budget over the
+        // caches in use), within FLOOR_FRAMES..MIN_FRAMES frames (or its own byte budget).
+        let size = f.byte_size();
+        let cap = self.budget.max(MIN_FRAMES.saturating_mul(size));
+        let floor = FLOOR_FRAMES.saturating_mul(size).min(cap);
+        let pool = &self.shared.pool;
+        let budget = (pool.budget() / pool.in_use()).clamp(floor, cap);
         let before = st.bytes;
         st.bytes += f.byte_size();
         if let Some(old) = st.frames.insert(pts, Arc::new(f)) {
@@ -591,7 +657,6 @@ impl GopCache {
                 filmcraft_frame::pool::recycle(v);
             }
         }
-        let pool = &self.shared.pool;
         if st.bytes >= before {
             pool.bytes.fetch_add(st.bytes - before, Ordering::Relaxed);
         } else {
@@ -653,8 +718,16 @@ impl GopCache {
         let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let _decoding = DecodingGuard::enter(me);
         st.last_used = Instant::now();
-        st.pin = want_pts;
         let background = filmcraft_media::cancel::background();
+        // A thumbnail of a clip a monitor is playing must not move its decoder or its eviction
+        // window away from the playhead (which then has to seek back and decode its GOP again).
+        let monitor_busy = background && st.foreground_used.is_some_and(|t| t.elapsed() < IDLE);
+        if !background {
+            st.foreground_used = Some(Instant::now());
+        }
+        if !monitor_busy {
+            st.pin = want_pts;
+        }
         if let Some(f) = st.cached(want_pts, draft).cloned() {
             HITS.fetch_add(1, Ordering::Relaxed);
             // a monitor asking for a frame of a thumbnail's clip makes its decoder one in use
@@ -662,6 +735,15 @@ impl GopCache {
             return Ok(f);
         }
         MISSES.fetch_add(1, Ordering::Relaxed);
+        if monitor_busy && st.decoder.is_some() {
+            // Decode privately (a few-thread decoder made for background work), leaving the
+            // monitor's decoder and frames as they are, and only the picture at the GOP's sync
+            // sample: a whole 4K GOP would take seconds of CPU from the playback beside it, and a
+            // thumbnail does not need the exact frame.
+            drop(st);
+            let key = decode_start(s, i);
+            return self.private_frame(s, key, s.pts(key), n);
+        }
         if !background {
             st.background = false;
         } else if st.decoder.is_none() {
@@ -1604,6 +1686,87 @@ mod tests {
         assert_eq!(s.decodes.load(Ordering::Relaxed), decodes);
         // Playback continues from the same run.
         assert_eq!(index_of(&c.frame(&s, 11_000).expect("frame")), 11);
+        assert_eq!(s.resets.load(Ordering::Relaxed), 1);
+    }
+
+    /// A thumbnail of a clip a monitor is playing decodes privately: the monitor's decoder is not
+    /// reset and its eviction window stays at the playhead (#4 of the memory audit).
+    #[test]
+    fn a_thumbnail_does_not_seek_the_decoder_of_a_playing_clip() {
+        use filmcraft_media::cancel::with_background;
+        let pool = Arc::new(Pool::new(MAX_LIVE_DECODERS, IDLE, FRAME_BUDGET).tiered(RECENT, HARD_DECODERS));
+        let (s, c) = (samples(600, 250, 3, false), GopCache::in_pool(None, pool.clone()));
+        assert_eq!(index_of(&c.frame(&s, 100_000).expect("frame")), 100);
+        // a thumbnail far away, in another GOP: the picture at its sync sample
+        assert_eq!(index_of(&with_background(true, || c.frame(&s, 420_000)).expect("thumbnail")), 250);
+        assert!(s.decodes.load(Ordering::Relaxed) < 120, "one GOP for playback, a few pictures for the thumbnail");
+        {
+            let st = c.shared.state.lock().unwrap();
+            assert_eq!(st.pin, 100_000, "the eviction window stays at the playhead");
+            assert!(st.frames.contains_key(&100_000));
+            assert!(!st.frames.contains_key(&250_000), "the private decode is not cached");
+        }
+        // (the private decoder starts at its sync sample: one reset of its own)
+        let resets = s.resets.load(Ordering::Relaxed);
+        assert!(!c.shared.state.lock().unwrap().decoder.as_ref().is_some_and(|d| d.thread_limited()), "the monitor keeps its decoder");
+        // playback carries on without a seek
+        assert_eq!(index_of(&c.frame(&s, 101_000).expect("frame")), 101);
+        assert_eq!(s.resets.load(Ordering::Relaxed), resets, "the monitor's decoder carried on");
+        assert_eq!(pool.decoders.load(Ordering::Relaxed), 1);
+    }
+
+    /// Caches in use share the pool's budget, each keeping at least FLOOR_FRAMES frames and at
+    /// most MIN_FRAMES (#1 of the memory audit: two 4K clips held 64 frames each).
+    #[test]
+    fn caches_in_use_share_the_budget_down_to_the_floor() {
+        // 1×1 RGBA pictures (4 bytes): a budget of 40 frames for all caches
+        let pool = Arc::new(Pool::new(usize::MAX, Duration::from_secs(3600), 160));
+        let (a, b) = (samples(300, 300, 0, false), samples(300, 300, 0, false));
+        let (mut ca, mut cb) = (GopCache::in_pool(None, pool.clone()), GopCache::in_pool(None, pool.clone()));
+        (ca.budget, cb.budget) = (0, 0);
+        // (the count of caches in use is refreshed every IN_USE_REFRESH: every request here)
+        let fresh = || *pool.in_use.lock().unwrap() = None;
+        for k in 0..100 {
+            // both play: their requests alternate
+            fresh();
+            assert_eq!(index_of(&ca.frame(&a, k * 1000).expect("frame")), k as usize);
+            fresh();
+            assert_eq!(index_of(&cb.frame(&b, k * 1000).expect("frame")), k as usize);
+        }
+        let held = |c: &GopCache| c.shared.state.lock().unwrap().frames.len();
+        // 40 frames between two caches in use: 20 each (above the floor of 16, below 64)
+        assert_eq!((held(&ca), held(&cb)), (20, 20));
+        // a third clip in use crowds them down to the floor, never below
+        let (c3, mut cc) = (samples(300, 300, 0, false), GopCache::in_pool(None, pool.clone()));
+        cc.budget = 0;
+        for k in 100..140 {
+            fresh();
+            ca.frame(&a, k * 1000).expect("frame");
+            fresh();
+            cb.frame(&b, k * 1000).expect("frame");
+            fresh();
+            cc.frame(&c3, k * 1000).expect("frame");
+        }
+        assert_eq!((held(&ca), held(&cb), held(&cc)), (FLOOR_FRAMES, FLOOR_FRAMES, FLOOR_FRAMES));
+    }
+
+    /// With the smaller budgets, forward playback still keeps every picture a decoder output ahead
+    /// of the wanted one (in a burst): those are the next ones shown, and evicting them for frames
+    /// already shown would mean decoding them again.
+    #[test]
+    fn eviction_keeps_the_frames_decoded_ahead_of_the_playhead() {
+        let s = Burst { n: 400, burst: 50, held: VecDeque::new(), resets: Default::default(), decodes: Default::default() };
+        let mut c = GopCache::new(None);
+        c.budget = 0;
+        let mut lost = 0;
+        for k in 0..300i64 {
+            assert_eq!(index_of(&c.frame(&s, k * 1000).expect("frame")), k as usize);
+            let st = c.shared.state.lock().unwrap();
+            // every picture output so far ahead of the playhead is still there
+            lost += (k * 1000..=st.out_max).step_by(1000).filter(|p| !st.frames.contains_key(p)).count();
+        }
+        assert_eq!(lost, 0, "frames decoded ahead of the playhead were evicted");
+        // ... so the burst decoder never had to walk a GOP twice
         assert_eq!(s.resets.load(Ordering::Relaxed), 1);
     }
 

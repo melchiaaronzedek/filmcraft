@@ -20,7 +20,10 @@ fn fixture(name: &str, args: &[&str]) -> Option<Arc<[u8]>> {
     std::fs::create_dir_all(&dir).ok()?;
     let out = dir.join(name);
     if !out.exists() {
-        let st = Command::new(ff).args(["-y", "-v", "error"]).args(args).arg(&out).status().ok()?;
+        // `-fps_mode` is ffmpeg 5.1+; older ones (Ubuntu 22.04's 4.4) spell it `-vsync`
+        let [fps_flag, _] = filmcraft_testkit::fps_passthrough_args(std::path::Path::new(&ff));
+        let args: Vec<&str> = args.iter().map(|&a| if a == "-fps_mode" { fps_flag } else { a }).collect();
+        let st = Command::new(ff).args(["-y", "-v", "error"]).args(&args).arg(&out).status().ok()?;
         if !st.success() {
             eprintln!("fixture {name} failed; skipping");
             return None;

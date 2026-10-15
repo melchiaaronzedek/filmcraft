@@ -12,7 +12,6 @@
 //! AAC, MPEG audio and AC-3 packets each decode to a fixed number of samples, which millisecond
 //! timestamps can't express: their packets run on from one another (see [`audio_starts`]).
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use filmcraft_color::{ColorInfo, Matrix, Transfer};
@@ -34,8 +33,8 @@ pub fn sniff(b: &[u8]) -> bool {
 
 struct AudioState {
     decoder: Option<PacketDecoder>,
-    packets: HashMap<usize, Arc<Vec<Vec<f32>>>>,
-    order: Vec<usize>,
+    /// Decoded packets by sample index, within [`crate::audio::PacketCache`]'s bounds.
+    packets: crate::audio::PacketCache,
     last_decoded: Option<usize>,
 }
 
@@ -446,7 +445,7 @@ impl MkvSource {
                     }
                     _ => 0,
                 };
-                let state = Mutex::new(AudioState { decoder: None, packets: HashMap::new(), order: Vec::new(), last_decoded: None });
+                let state = Mutex::new(AudioState { decoder: None, packets: Default::default(), last_decoded: None });
                 Some(MkvAudio { track: i, state, starts, preroll })
             })
             .collect();
@@ -547,11 +546,6 @@ impl MkvSource {
         };
         let p = Arc::new(decoded);
         st.packets.insert(i, p.clone());
-        st.order.push(i);
-        if st.order.len() > 4096 {
-            let old = st.order.remove(0);
-            st.packets.remove(&old);
-        }
         Ok(p)
     }
 }
