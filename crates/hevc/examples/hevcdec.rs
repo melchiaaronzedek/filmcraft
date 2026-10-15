@@ -8,8 +8,38 @@
 //! - `HEVC_DRAFT=1`: draft mode (non-reference pictures skip deblocking and SAO)
 //! - `HEVC_MEM_MB=m`: limit the pictures in flight to about m MB ([`Decoder::set_memory_limit`])
 
-use filmcraft_hevc::Decoder;
+use filmcraft_hevc::{Decoder, Plane};
 use std::io::Write;
+use std::sync::Mutex;
+
+/// Output planes handed back for reuse, as the app's frame pool does (`filmcraft_frame::pool`):
+/// without it every picture's planes are fresh allocations whose page faults are counted as
+/// decoding time.
+static POOL_U8: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static POOL_U16: Mutex<Vec<Vec<u16>>> = Mutex::new(Vec::new());
+
+fn take<T>(pool: &Mutex<Vec<Vec<T>>>, len: usize) -> Vec<T> {
+    let mut p = pool.lock().unwrap();
+    match p.iter().position(|b| b.capacity() >= len) {
+        Some(i) => p.swap_remove(i),
+        None => Vec::with_capacity(len),
+    }
+}
+
+fn take_u8(len: usize) -> Vec<u8> {
+    take(&POOL_U8, len)
+}
+
+fn take_u16(len: usize) -> Vec<u16> {
+    take(&POOL_U16, len)
+}
+
+fn give(plane: Plane) {
+    match plane {
+        Plane::U8(v) => POOL_U8.lock().unwrap().push(v),
+        Plane::U16(v) => POOL_U16.lock().unwrap().push(v),
+    }
+}
 
 /// Access units of an Annex-B stream: a new one starts at a VPS / SPS / PPS / AUD / prefix SEI
 /// after a VCL NAL unit, or at a VCL NAL unit with first_slice_segment_in_pic_flag.
@@ -65,6 +95,7 @@ fn main() {
     let mem = env("HEVC_MEM_MB").map(|m| m << 20);
     let mut out = args.get(2).map(|p| std::io::BufWriter::with_capacity(1 << 24, std::fs::File::create(p).expect("create output")));
     let aus = access_units(&data);
+    filmcraft_hevc::set_plane_allocators(take_u8, take_u16);
     let t0 = std::time::Instant::now();
     let mut count = 0usize;
     let mut in_flight = 0;
@@ -80,6 +111,9 @@ fn main() {
                         w.write_all(&plane.to_le_bytes()).expect("write output");
                     }
                 }
+                give(p.y);
+                give(p.u);
+                give(p.v);
             }
         };
         for (i, au) in aus.iter().enumerate() {

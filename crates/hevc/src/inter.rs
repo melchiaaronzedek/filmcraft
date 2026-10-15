@@ -146,6 +146,7 @@ fn v_taps<'a, P>(rows: &'a [&'a [P]], r: usize, x: usize) -> impl Fn(usize) -> O
 /// m = T / 2 - 1). The window rows are the reference picture's own lines when the window lies
 /// inside it horizontally, or lines of an edge-replicated copy.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn interpolate<P: Px, const T: usize>(
     rows: &[&[P]],
     tmp: &mut [i16],
@@ -197,6 +198,7 @@ fn interpolate<P: Px, const T: usize>(
 /// at (x0, y0): read straight from the reference lines when the window is inside the picture
 /// horizontally, else from an edge-replicated copy.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn predict_block<S: Sample, const T: usize>(
     f: &Frame,
     c: usize,
@@ -239,7 +241,11 @@ pub fn mc_luma<S: Sample>(f: &Frame, x: i32, y: i32, mv: [i16; 2], w: usize, h: 
     let yi = y + (mv[1] as i32 >> 2);
     let shift1 = bd.min(12) - 8;
     let shift3 = 14 - bd;
-    predict_block::<S, 8>(f, 0, (xi - 3, yi - 3), (fx, fy), (&LUMA_FILTER[fx], &LUMA_FILTER[fy]), (w, h), (shift1, shift3), out, sc);
+    // compiled per instruction set, the best one at run time (`crate::simd`)
+    crate::simd::run(
+        #[inline(always)]
+        || predict_block::<S, 8>(f, 0, (xi - 3, yi - 3), (fx, fy), (&LUMA_FILTER[fx], &LUMA_FILTER[fy]), (w, h), (shift1, shift3), out, sc),
+    );
 }
 
 /// Chroma prediction samples of a w x h chroma block at chroma position (x, y) displaced by the
@@ -253,7 +259,10 @@ pub fn mc_chroma<S: Sample>(f: &Frame, c: usize, x: i32, y: i32, mv: [i32; 2], w
     let yi = y + (mv[1] >> 3);
     let shift1 = bd.min(12) - 8;
     let shift3 = 14 - bd;
-    predict_block::<S, 4>(f, c + 1, (xi - 1, yi - 1), (fx, fy), (&CHROMA_FILTER[fx], &CHROMA_FILTER[fy]), (w, h), (shift1, shift3), out, sc);
+    crate::simd::run(
+        #[inline(always)]
+        || predict_block::<S, 4>(f, c + 1, (xi - 1, yi - 1), (fx, fy), (&CHROMA_FILTER[fx], &CHROMA_FILTER[fy]), (w, h), (shift1, shift3), out, sc),
+    );
 }
 
 /// The chroma motion vector in 1/8 chroma sample units (8-228 / 8-229 of 8.5.3.2.10) of the luma
@@ -287,7 +296,10 @@ macro_rules! by_width {
 
 /// Default weighted prediction, one list (8-262).
 pub fn put_uni<S: Sample>(p: &[i16], w: usize, h: usize, bd: u32, dst: &mut [S], ds: usize) {
-    by_width!(w, put_uni_w(p, w, h, bd, dst, ds))
+    crate::simd::run(
+        #[inline(always)]
+        || by_width!(w, put_uni_w(p, w, h, bd, dst, ds)),
+    )
 }
 
 /// [`put_uni`] for rows of `W` samples (`W` = 0: rows of `w`).
@@ -312,7 +324,10 @@ fn put_uni_w<S: Sample, const W: usize>(p: &[i16], w: usize, h: usize, bd: u32, 
 
 /// Default weighted prediction, bi-prediction (8-263).
 pub fn put_bi<S: Sample>(p0: &[i16], p1: &[i16], w: usize, h: usize, bd: u32, dst: &mut [S], ds: usize) {
-    by_width!(w, put_bi_w(p0, p1, w, h, bd, dst, ds))
+    crate::simd::run(
+        #[inline(always)]
+        || by_width!(w, put_bi_w(p0, p1, w, h, bd, dst, ds)),
+    )
 }
 
 /// [`put_bi`] for rows of `W` samples (`W` = 0: rows of `w`).
