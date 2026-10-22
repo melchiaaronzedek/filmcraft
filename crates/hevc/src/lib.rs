@@ -31,6 +31,7 @@ mod intra;
 mod mvpred;
 pub mod params;
 mod picture;
+mod simd;
 pub mod slice;
 mod slicedec;
 #[rustfmt::skip]

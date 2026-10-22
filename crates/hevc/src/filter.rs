@@ -132,6 +132,15 @@ fn edge_params<S: Sample>(pic: &PicState<S>, px: usize, py: usize, qx: usize, qy
 
 /// Deblock CTB row `r`: vertical edges of the row, then horizontal edges whose q side is in the row.
 fn deblock_row<S: Sample>(pic: &mut PicState<S>, r: usize) {
+    // compiled per instruction set, the best one at run time (`crate::simd`)
+    crate::simd::run(
+        #[inline(always)]
+        || deblock_row_impl(pic, r),
+    )
+}
+
+#[inline(always)]
+fn deblock_row_impl<S: Sample>(pic: &mut PicState<S>, r: usize) {
     if !pic.deblocking_enabled_anywhere || pic.draft {
         return;
     }
@@ -243,6 +252,7 @@ fn deblock_row<S: Sample>(pic: &mut PicState<S>, r: usize) {
 /// the 4 lines at a time for horizontal ones (`along` = 1): no per-sample index arithmetic or
 /// bounds checks in the filter itself.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn filter_luma<S: Sample>(s: &mut [S], o: usize, step: usize, along: usize, tc: i32, beta: i32, nfp: bool, nfq: bool, bd: u32) {
     // l[k][i]: line k, i = 0..4 -> p3, p2, p1, p0 and i = 4..8 -> q0, q1, q2, q3
     let mut l = [[0i32; 8]; 4];
@@ -284,6 +294,7 @@ fn filter_luma<S: Sample>(s: &mut [S], o: usize, step: usize, along: usize, tc: 
 
 /// The luma edge filter (8.7.2.5.3 decisions, 8.7.2.5.7 filtering) on the lines of
 /// [`filter_luma`]; false when the edge is left unfiltered (d >= beta).
+#[inline(always)]
 fn filter_luma_lines(l: &mut [[i32; 8]; 4], tc: i32, beta: i32, nfp: bool, nfq: bool, bd: u32) -> bool {
     let px = |l: &[[i32; 8]; 4], k: usize, i: usize| l[k][3 - i];
     let qx = |l: &[[i32; 8]; 4], k: usize, i: usize| l[k][4 + i];
@@ -347,6 +358,7 @@ fn filter_luma_lines(l: &mut [[i32; 8]; 4], tc: i32, beta: i32, nfp: bool, nfq: 
 
 /// Filter one 4-sample chroma edge segment.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn filter_chroma<S: Sample>(s: &mut [S], o: usize, step: usize, along: usize, tc: i32, nfp: bool, nfq: bool, bd: u32) {
     let max = (1i32 << bd) - 1;
     for k in 0..4 {
@@ -365,6 +377,14 @@ fn filter_chroma<S: Sample>(s: &mut [S], o: usize, step: usize, along: usize, tc
 
 /// SAO of CTB row `r` from the deblocked planes into new row buffers (luma, Cb, Cr).
 fn sao_row<S: Sample>(pic: &PicState<S>, r: usize) -> [Vec<S>; 3] {
+    crate::simd::run(
+        #[inline(always)]
+        || sao_row_impl(pic, r),
+    )
+}
+
+#[inline(always)]
+fn sao_row_impl<S: Sample>(pic: &PicState<S>, r: usize) -> [Vec<S>; 3] {
     let ctb = 1usize << pic.log2_ctb;
     let (sx, sy) = pic.chroma.shifts();
     let mut out: [Vec<S>; 3] = [Vec::new(), Vec::new(), Vec::new()];
@@ -397,6 +417,7 @@ fn sao_row<S: Sample>(pic: &PicState<S>, r: usize) -> [Vec<S>; 3] {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn sao_ctb<S: Sample>(
     pic: &PicState<S>,
     c: usize,
