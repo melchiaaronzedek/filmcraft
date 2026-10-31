@@ -163,6 +163,14 @@ pub fn frame_size(f: &Fixture) -> usize {
     (w * h + 2 * cw * ch) * bps
 }
 
+/// The pixel format ffprobe reports for the video stream in `path`.
+fn stream_pix_fmt(ffprobe: &Path, path: &Path) -> Option<String> {
+    let mut c = Command::new(ffprobe);
+    c.args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=pix_fmt", "-of", "csv=p=0"]).arg(path);
+    let o = c.output().ok().filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+}
+
 /// Generate (if needed) the fixture stream and its ffmpeg reference decode.
 /// Returns None (with a message) when ffmpeg or the encoder is unavailable.
 pub fn ensure(f: &Fixture) -> Option<(PathBuf, PathBuf)> {
@@ -193,7 +201,20 @@ pub fn ensure(f: &Fixture) -> Option<(PathBuf, PathBuf)> {
             eprintln!("SKIPPED ({}): encoder unavailable", f.name);
             return None;
         }
-        std::fs::rename(&tmp, &hevc).unwrap();
+        filmcraft_testkit::fixtures::publish(&tmp, &hevc).unwrap();
+    }
+    if f.bit_depth > 8 {
+        // An 8-bit-only libx265 (Arch Linux ARM's) encodes 8-bit without an error when asked for
+        // 10, and the reference decode scales that up to 10 bits, so no sample would match.
+        let probe = filmcraft_testkit::ffprobe_or_skip(f.name)?;
+        let got = stream_pix_fmt(&probe, &hevc);
+        if got.as_deref() != Some(pix_fmt(f.bit_depth, f.chroma)) {
+            let _ = std::fs::remove_file(&hevc);
+            let _ = std::fs::remove_file(&yuv);
+            let reason = format!("the encoder made {} instead of {}", got.as_deref().unwrap_or("no stream"), pix_fmt(f.bit_depth, f.chroma));
+            filmcraft_testkit::skip(f.name, &format!("{reason} (libx265 built for 8 bits only?)"));
+            return None;
+        }
     }
     if !yuv.exists() {
         let tmp = filmcraft_testkit::temp_path(&yuv);
@@ -202,7 +223,7 @@ pub fn ensure(f: &Fixture) -> Option<(PathBuf, PathBuf)> {
         c.args(filmcraft_testkit::fps_passthrough_args(&ff));
         c.args(["-f", "rawvideo", "-pix_fmt", pix_fmt(f.bit_depth, f.chroma)]).arg(&tmp);
         assert!(run(&mut c), "reference decode failed for {}", f.name);
-        std::fs::rename(&tmp, &yuv).unwrap();
+        filmcraft_testkit::fixtures::publish(&tmp, &yuv).unwrap();
     }
     Some((hevc, yuv))
 }
